@@ -5,19 +5,24 @@ import json
 import os
 
 app = Flask(__name__)
+# This allows your VincentAI website to talk to this server
 CORS(app)
 
 @app.route('/', methods=['GET'])
 def home():
-    return "VincentAI Backend is Running!"
+    return "VincentAI Backend is Online!"
 
 @app.route('/chat', methods=['POST'])
 def chat():
+    # 1. Receive data from your HTML
     data = request.json
-    model = data.get('model')
-    message = data.get('message')
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+        
+    model = data.get('model', 'DeepSeek V3.2')
+    message = data.get('message', '')
 
-    # DeepAI Logic
+    # 2. The "Old Script" Logic (DeepAI Spoofing)
     url = "https://api.deepai.org/hacking_is_a_serious_crime"
     headers = {
         "api-key": "tryit-48957598737-7bf6498cad4adf00c76eb3dfa97dc26d",
@@ -34,6 +39,7 @@ def chat():
     }
 
     try:
+        # 3. Send to DeepAI and return the answer to your HTML
         r = requests.post(url, data=payload, headers=headers)
         return r.text
     except Exception as e:
