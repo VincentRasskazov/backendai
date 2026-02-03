@@ -9,16 +9,11 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURATION ---
-# The password you must enter in the UI to use the API. 
-# Change 'vincent-secret' to something harder if you want!
-API_PASSWORD = os.environ.get('API_PASSWORD', 'vincent-secret')
-
 # DeepAI Config
 DEEPAI_URL = "https://api.deepai.org/hacking_is_a_serious_crime"
 DEEPAI_KEY = "tryit-48957598737-7bf6498cad4adf00c76eb3dfa97dc26d"
 
-# --- KEEP-ALIVE (Prevents Render Sleeping) ---
+# --- KEEP-ALIVE ---
 def keep_alive():
     time.sleep(10)
     app_url = os.environ.get('RENDER_EXTERNAL_URL')
@@ -40,17 +35,12 @@ def health():
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    # 1. SECURITY CHECK
-    auth_header = request.headers.get('x-vincent-password')
-    if auth_header != API_PASSWORD:
-        return jsonify({"error": "⛔ ACCESS DENIED: Incorrect API Password."}), 401
-
     try:
         data = request.json
         message = data.get('message', '')
         model = data.get('model', 'DeepSeek V3.2')
         
-        # Payload exactly as required by the provider
+        # Prepare payload exactly as requested
         payload = {
             "chat_style": "chat",
             "chatHistory": json.dumps([{"role": "user", "content": message}]),
