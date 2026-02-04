@@ -1,104 +1,174 @@
 import os
 import json
-import time
-import hashlib
+import uuid
+import datetime
 import requests
-import threading
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# --- SECURITY CONFIG ---
-# This "SALT" must match exactly what is in your Frontend HTML
-# This prevents people from just calling your API without generating the correct hash.
-SECRET_SALT = "vincent-gemini-ultra-secure-salt-2026-x" 
+# --- PROVIDER LOGIC ---
 
-# DeepAI Config
-DEEPAI_URL = "https://api.deepai.org/hacking_is_a_serious_crime"
-DEEPAI_KEY = "tryit-48957598737-7bf6498cad4adf00c76eb3dfa97dc26d"
-
-# --- HELPER: Verify Token ---
-def verify_security_token(msg_id, token):
-    """
-    Verifies that the request came from your specific Frontend.
-    Logic: SHA256(msg_id + SECRET_SALT)
-    """
-    if not msg_id or not token:
-        return False
+def stream_venice(message):
+    url = "https://outerface.venice.ai/api/inference/chat"
+    payload = {
+        "conversationId": str(uuid.uuid4())[:7],
+        "conversationType": "text",
+        "modelId": "zai-org-glm-4.6",
+        "prompt": [{"role": "user", "content": message}],
+        "requestId": str(uuid.uuid4())[:8],
+        "temperature": 0.7,
+        "topP": 0.9,
+        "webEnabled": True
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": "https://venice.ai",
+        "Referer": "https://venice.ai/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "x-venice-version": "interface@python-client"
+    }
     
-    # Re-create the hash locally
-    raw_string = f"{msg_id}{SECRET_SALT}"
-    expected_token = hashlib.sha256(raw_string.encode()).hexdigest()
+    with requests.post(url, json=payload, headers=headers, stream=True) as r:
+        for line in r.iter_lines(decode_unicode=True):
+            if line:
+                try:
+                    obj = json.loads(line)
+                    if obj.get("kind") == "content":
+                        yield obj.get("content", "")
+                except: pass
+
+def stream_overchat(message):
+    url = "https://api.overchat.ai/v1/chat/completions"
+    payload = {
+        "chatId": str(uuid.uuid4()),
+        "model": "gpt-5.2-nano",
+        "messages": [{"id": str(uuid.uuid4()), "role": "user", "content": message}],
+        "stream": True,
+        "personaId": "free-chat-gpt-landing"
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "python-overchat-client/1.0",
+        "x-device-uuid": str(uuid.uuid4())
+    }
     
-    # Compare
-    return token == expected_token
+    with requests.post(url, json=payload, headers=headers, stream=True) as r:
+        for line in r.iter_lines(decode_unicode=True):
+            if line and line.startswith("data:"):
+                data = line[5:].strip()
+                if data == "[DONE]": break
+                try:
+                    obj = json.loads(data)
+                    chunk = obj.get("choices", [{}])[0].get("delta", {}).get("content")
+                    if chunk: yield chunk
+                except: pass
 
-# --- KEEP-ALIVE (Prevents Sleep) ---
-def keep_alive():
-    time.sleep(10)
-    app_url = os.environ.get('RENDER_EXTERNAL_URL')
-    if app_url:
-        print(f"Starting keep-alive heartbeat for {app_url}")
-        while True:
-            try:
-                time.sleep(800) # Ping every 13.3 minutes
-                requests.get(f"{app_url}/health")
-            except:
-                pass
-threading.Thread(target=keep_alive, daemon=True).start()
+def stream_talkai(message):
+    url = "https://talkai.info/chat/send/"
+    payload = {
+        "type": "chat",
+        "messagesHistory": [{"id": str(uuid.uuid4()), "from": "you", "content": message}],
+        "settings": {"model": "gpt-4.1-nano", "temperature": 0.7}
+    }
+    headers = {"Content-Type": "application/json", "Origin": "https://talkai.info", "Referer": "https://talkai.info/chat/", "User-Agent": "Mozilla/5.0"}
 
-# --- ROUTES ---
+    with requests.post(url, json=payload, headers=headers, stream=True) as r:
+        for line in r.iter_lines(decode_unicode=True):
+            if line and line.startswith("data:"):
+                data = line[5:].strip()
+                if not data or data.startswith("GPT") or data == "-1": continue
+                if "internal server error" in data.lower(): break
+                yield data + " "
+
+def stream_notegpt(message):
+    url = "https://notegpt.io/api/v2/chat/stream"
+    payload = {
+        "conversation_id": str(uuid.uuid4()),
+        "message": message,
+        "language": "en",
+        "model": "gpt-4.1-mini"
+    }
+    headers = {"Content-Type": "application/json", "Origin": "https://notegpt.io", "Referer": "https://notegpt.io/ai-chat", "User-Agent": "Mozilla/5.0"}
+
+    with requests.post(url, json=payload, headers=headers, stream=True) as r:
+        for line in r.iter_lines(decode_unicode=True):
+            if line and line.startswith("data:"):
+                try:
+                    obj = json.loads(line[5:].strip())
+                    if obj.get("done"): break
+                    if "text" in obj: yield obj["text"]
+                except: pass
+
+def stream_useai(message):
+    url = "https://use.ai/v1/chat"
+    chat_id = str(uuid.uuid4())
+    payload = {
+        "chatId": chat_id,
+        "selectedChatModel": "gateway-gpt-5",
+        "message": {
+            "id": uuid.uuid4().hex[:16],
+            "role": "user",
+            "parts": [{"type": "text", "text": message}]
+        }
+    }
+    headers = {"Content-Type": "application/json", "Origin": "https://use.ai", "Referer": f"https://use.ai/chat/{chat_id}", "User-Agent": "Mozilla/5.0"}
+
+    with requests.post(url, json=payload, headers=headers, stream=True) as r:
+        for line in r.iter_lines(decode_unicode=True):
+            if line and line.startswith("data:"):
+                data = line[5:].strip()
+                if data == "[DONE]": break
+                try:
+                    obj = json.loads(data)
+                    if obj.get("type") == "text-delta": yield obj.get("delta", "")
+                except: pass
+
+def stream_chatplus(message):
+    url = "https://chatplus.com/api/chat"
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    payload = {
+        "id": "guest",
+        "messages": [{"id": str(uuid.uuid4()), "createdAt": now, "role": "user", "content": message, "parts": [{"type": "text", "text": message}]}],
+        "selectedChatModelId": "gpt-4o-mini",
+        "token": None
+    }
+    headers = {"Content-Type": "application/json", "Origin": "https://chatplus.com", "User-Agent": "Mozilla/5.0"}
+
+    with requests.post(url, json=payload, headers=headers, stream=True) as r:
+        for chunk in r.iter_lines(decode_unicode=True):
+            if chunk and chunk.startswith("0:"):
+                text = chunk.split(":", 1)[1].strip()
+                if text.startswith('"') and text.endswith('"'): text = text[1:-1]
+                yield text
+
+# --- ROUTER ---
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "online", "system": "VincentAI Backend"}), 200
+    return "OK", 200
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "No payload"}), 400
-        
-        # 1. EXTRACT SECURITY FIELDS
-        msg_id = data.get('id')      # The UUID generated by frontend
-        token = data.get('token')    # The SHA256 hash generated by frontend
-        
-        # 2. VERIFY TOKEN
-        if not verify_security_token(msg_id, token):
-            print(f"Security Alert: Invalid Token for ID {msg_id}")
-            return jsonify({"error": "⛔ 403 Forbidden: Invalid Security Token. Request rejected."}), 403
+    data = request.json
+    message = data.get('message', '')
+    model = data.get('model', 'venice')
 
-        # 3. EXTRACT DATA
-        message = data.get('message', '')
-        model = data.get('model', 'DeepSeek V3.2')
-        
-        # 4. PREPARE DEEPAI PAYLOAD
-        payload = {
-            "chat_style": "chat",
-            "chatHistory": json.dumps([{"role": "user", "content": message}]),
-            "model": model,
-            "hacker_is_stinky": "very_stinky",
-            "enabled_tools": json.dumps(["image_generator", "image_editor"])
-        }
+    # Select Provider based on Model ID
+    provider_map = {
+        "venice": stream_venice,
+        "overchat": stream_overchat,
+        "talkai": stream_talkai,
+        "notegpt": stream_notegpt,
+        "useai": stream_useai,
+        "chatplus": stream_chatplus
+    }
 
-        headers = {
-            "api-key": DEEPAI_KEY,
-            "Origin": "https://deepai.org",
-            "Referer": "https://deepai.org/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-        }
-
-        # 5. FORWARD REQUEST
-        r = requests.post(DEEPAI_URL, data=payload, headers=headers)
-        
-        # Return raw text for streaming effect on frontend
-        return Response(r.text, mimetype='text/plain')
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    generator_func = provider_map.get(model, stream_venice)
+    
+    return Response(stream_with_context(generator_func(message)), mimetype='text/plain')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
