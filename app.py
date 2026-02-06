@@ -2,6 +2,8 @@ import os
 import json
 import uuid
 import datetime
+import time
+import threading
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
@@ -9,7 +11,28 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# --- 1. VENICE AI (GLM 4.6) ---
+# --- SELF HEALING / KEEP ALIVE SYSTEM ---
+# Render spins down free tier apps after 15 mins of inactivity.
+# This thread pings the server every 10 mins to keep it alive.
+def keep_alive_worker():
+    port = int(os.environ.get('PORT', 10000))
+    url = f"http://127.0.0.1:{port}/health"
+    print(f"❤️  Heartbeat system active. Pinging {url} every 10 minutes.")
+    
+    while True:
+        time.sleep(600) # Wait 10 minutes
+        try:
+            requests.get(url)
+            print("❤️  Heartbeat sent (Keep-Alive)")
+        except Exception as e:
+            print(f"⚠️  Heartbeat failed: {e}")
+
+# Start the background thread
+threading.Thread(target=keep_alive_worker, daemon=True).start()
+
+# --- PROVIDER LOGIC ---
+
+# 1. VENICE AI (GLM 4.6)
 def stream_venice(message):
     url = "https://outerface.venice.ai/api/inference/chat"
     headers = {
@@ -39,7 +62,7 @@ def stream_venice(message):
                     except: pass
     except Exception as e: yield f"Error: {e}"
 
-# --- 2. OVERCHAT (GPT-5 Nano) ---
+# 2. OVERCHAT (GPT-5 Nano)
 def stream_overchat(message):
     url = "https://api.overchat.ai/v1/chat/completions"
     headers = {
@@ -68,7 +91,7 @@ def stream_overchat(message):
                     except: pass
     except Exception as e: yield f"Error: {e}"
 
-# --- 3. TALK AI (GPT-4.1) ---
+# 3. TALK AI (GPT-4.1)
 def stream_talkai(message):
     url = "https://talkai.info/chat/send/"
     headers = {
@@ -92,7 +115,7 @@ def stream_talkai(message):
                     yield data + " "
     except Exception as e: yield f"Error: {e}"
 
-# --- 4. NOTEGPT (GPT-4 Mini) ---
+# 4. NOTEGPT (GPT-4 Mini)
 def stream_notegpt(message):
     url = "https://notegpt.io/api/v2/chat/stream"
     headers = {
@@ -119,7 +142,7 @@ def stream_notegpt(message):
                     except: pass
     except Exception as e: yield f"Error: {e}"
 
-# --- 5. USE AI (Gateway 5) ---
+# 5. USE AI (GPT-5)
 def stream_useai(message):
     url = "https://use.ai/v1/chat"
     chat_id = str(uuid.uuid4())
@@ -153,7 +176,7 @@ def stream_useai(message):
                     except: pass
     except Exception as e: yield f"Error: {e}"
 
-# --- 6. CHATPLUS (GPT-4o) ---
+# 6. CHATPLUS (GPT-4o)
 def stream_chatplus(message):
     url = "https://chatplus.com/api/chat"
     now = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
@@ -184,8 +207,8 @@ def stream_chatplus(message):
                     yield text
     except Exception as e: yield f"Error: {e}"
 
-# --- 7. DEEPAI (DeepSeek/Llama) ---
-def stream_deepai(message):
+# 7. DEEPAI (Specific Model Logic)
+def stream_deepai(message, model_name="DeepSeek V3.2"):
     url = "https://api.deepai.org/hacking_is_a_serious_crime"
     headers = {
         "api-key": "tryit-48957598737-7bf6498cad4adf00c76eb3dfa97dc26d",
@@ -194,7 +217,7 @@ def stream_deepai(message):
     payload = {
         "chat_style": "chat", 
         "chatHistory": json.dumps([{"role": "user", "content": message}]), 
-        "model": "DeepSeek V3.2",
+        "model": model_name,
         "hacker_is_stinky": "very_stinky"
     }
     try:
@@ -212,21 +235,45 @@ def health():
 def chat():
     data = request.json
     message = data.get('message', '')
-    model = data.get('model', 'venice')
+    model_key = data.get('model', 'venice')
 
-    providers = {
-        "venice": stream_venice,
-        "overchat": stream_overchat,
-        "talkai": stream_talkai,
-        "notegpt": stream_notegpt,
-        "useai": stream_useai,
-        "chatplus": stream_chatplus,
-        "deepai": stream_deepai
-    }
+    # Mapping frontend keys to functions or specific configurations
+    if model_key == "venice":
+        return Response(stream_with_context(stream_venice(message)), mimetype='text/plain')
     
-    # Pick the function, default to Venice if not found
-    generator = providers.get(model, stream_venice)
-    return Response(stream_with_context(generator(message)), mimetype='text/plain')
+    elif model_key == "overchat":
+        return Response(stream_with_context(stream_overchat(message)), mimetype='text/plain')
+    
+    elif model_key == "talkai":
+        return Response(stream_with_context(stream_talkai(message)), mimetype='text/plain')
+    
+    elif model_key == "notegpt":
+        return Response(stream_with_context(stream_notegpt(message)), mimetype='text/plain')
+    
+    elif model_key == "useai":
+        return Response(stream_with_context(stream_useai(message)), mimetype='text/plain')
+    
+    elif model_key == "chatplus":
+        return Response(stream_with_context(stream_chatplus(message)), mimetype='text/plain')
+    
+    # --- DeepAI Variants ---
+    elif model_key.startswith("deepai-"):
+        # Map frontend key to DeepAI's internal model name
+        deepai_map = {
+            "deepai-deepseek": "DeepSeek V3.2",
+            "deepai-llama": "Llama 3.3 70B Instruct",
+            "deepai-qwen": "Qwen3 30B",
+            "deepai-4omini": "GPT-4o mini",
+            "deepai-gemma3": "Gemma 3 12B",
+            "deepai-gemma2": "Gemma2 9B",
+            "deepai-4nano": "GPT-4.1 Nano"
+        }
+        specific_model = deepai_map.get(model_key, "DeepSeek V3.2")
+        return Response(stream_with_context(stream_deepai(message, specific_model)), mimetype='text/plain')
+
+    else:
+        # Default
+        return Response(stream_with_context(stream_venice(message)), mimetype='text/plain')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
