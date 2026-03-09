@@ -11,9 +11,26 @@ import g4f  # Requirement: pip install g4f
 import websockets # Requirement: pip install websockets
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
+import firebase_admin # Requirement: pip install firebase-admin
+from firebase_admin import credentials, messaging
 
 app = Flask(__name__)
 CORS(app)
+
+# --- FIREBASE ADMIN SETUP ---
+# Securely load the Firebase Service Account from Render Environment Variables
+firebase_cred_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+if firebase_cred_json:
+    try:
+        cred_dict = json.loads(firebase_cred_json)
+        cred = credentials.Certificate(cred_dict)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        print("✅ Firebase Admin SDK Initialized!")
+    except Exception as e:
+        print(f"⚠️ Failed to initialize Firebase Admin: {e}")
+else:
+    print("⚠️ FIREBASE_SERVICE_ACCOUNT env var missing. Push notifications disabled.")
 
 # --- CONFIGURATION ---
 # Hardcoded Public URL for Heartbeat
@@ -231,8 +248,32 @@ def stream_g4f(message):
     except Exception as e: yield f"G4F Error: {e}"
 
 # --- ROUTER ---
+# --- ROUTER ---
 @app.route('/health', methods=['GET'])
 def health(): return "OK", 200
+
+@app.route('/notify', methods=['POST'])
+def notify():
+    if not firebase_admin._apps:
+        return jsonify({"error": "Firebase Admin not configured on server"}), 500
+
+    data = request.json
+    token = data.get('fcmToken')
+    title = data.get('title', 'New Message')
+    body = data.get('body', 'You have a new message.')
+
+    if not token:
+        return jsonify({"error": "Missing fcmToken"}), 400
+
+    try:
+        msg = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=token,
+        )
+        response = messaging.send(msg)
+        return jsonify({"success": True, "message_id": response}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/chat', methods=['POST'])
 def chat():
