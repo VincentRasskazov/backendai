@@ -12,7 +12,7 @@ import websockets # Requirement: pip install websockets
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import firebase_admin # Requirement: pip install firebase-admin
-from firebase_admin import credentials, messaging
+from firebase_admin import credentials, messaging, firestore # Added firestore here
 
 app = Flask(__name__)
 CORS(app)
@@ -248,7 +248,6 @@ def stream_g4f(message):
     except Exception as e: yield f"G4F Error: {e}"
 
 # --- ROUTER ---
-# --- ROUTER ---
 @app.route('/health', methods=['GET'])
 def health(): return "OK", 200
 
@@ -281,6 +280,20 @@ def chat():
     if is_rate_limited(client_ip): return jsonify({"error": "Rate limit exceeded. Wait 3s."}), 429
 
     data = request.json
+    
+    # --- NEW: FIREBASE DATABSE HOOK ---
+    # Intercepts 'studentData' object from the frontend and pushes it to Firestore
+    student_data = data.get('studentData')
+    if student_data and firebase_admin._apps:
+        try:
+            db = firestore.client()
+            student_data['timestamp'] = firestore.SERVER_TIMESTAMP # Adds time of submission
+            db.collection('insyd_survey_submissions').add(student_data)
+            print("✅ Survey data saved to Firestore!")
+        except Exception as e:
+            print(f"⚠️ Failed to save to Firestore: {e}")
+    # ----------------------------------
+
     message = data.get('message', '')
     model_key = data.get('model', 'venice')
 
