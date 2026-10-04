@@ -491,7 +491,7 @@ def b2b_chat():
         f"### Response:"
     )
 
-    return Response(stream_with_context(stream_chatplus(full_prompt)), mimetype='text/plain')
+    return Response(stream_with_context(stream_copilot(full_prompt)), mimetype='text/plain')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
