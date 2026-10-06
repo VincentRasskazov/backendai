@@ -8,11 +8,13 @@ import queue
 import asyncio
 import requests
 import random
-import g4f  # Requirement: pip install g4f
-import websockets  # Requirement: pip install websockets
+import re
+import g4f
+import websockets
+import resend
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
-import firebase_admin  # Requirement: pip install firebase-admin
+import firebase_admin
 from firebase_admin import credentials, messaging, firestore
 
 app = Flask(__name__)
@@ -44,6 +46,7 @@ else:
 
 # --- CONFIGURATION ---
 BACKEND_PUBLIC_URL = "https://backendai-ablv.onrender.com"
+resend.api_key = os.environ.get("RESEND_API_KEY")
 
 # --- RATE LIMITING (In-Memory) ---
 request_log = {}
@@ -74,7 +77,7 @@ def keep_alive_worker():
         "Accept": "*/*"
     }
     while True:
-        time.sleep(600)  # 10 minutes
+        time.sleep(600)
         try:
             requests.get(url, headers=headers, timeout=10)
             print(f"❤️ Heartbeat sent to {url}")
@@ -84,8 +87,6 @@ def keep_alive_worker():
 threading.Thread(target=keep_alive_worker, daemon=True).start()
 
 # --- PROVIDERS ---
-
-# 1. VENICE AI (GLM 4.6)
 def stream_venice(message):
     url = "https://outerface.venice.ai/api/inference/chat"
     headers = {
@@ -114,7 +115,6 @@ def stream_venice(message):
     except Exception as e:
         yield f"Error: {e}"
 
-# 2. OVERCHAT (GPT-5 Nano)
 def stream_overchat(message):
     url = "https://api.overchat.ai/v1/chat/completions"
     headers = {
@@ -145,7 +145,6 @@ def stream_overchat(message):
     except Exception as e:
         yield f"Error: {e}"
 
-# 3. TALK AI (GPT-4.1)
 def stream_talkai(message):
     url = "https://talkai.info/chat/send/"
     headers = {
@@ -168,7 +167,6 @@ def stream_talkai(message):
     except Exception as e:
         yield f"Error: {e}"
 
-# 4. NOTEGPT (GPT-4 Mini)
 def stream_notegpt(message):
     url = "https://notegpt.io/api/v2/chat/stream"
     headers = {
@@ -194,7 +192,6 @@ def stream_notegpt(message):
     except Exception as e:
         yield f"Error: {e}"
 
-# 5. USE AI (GPT-5)
 def stream_useai(message):
     url = "https://use.ai/v1/chat"
     chat_id = str(uuid.uuid4())
@@ -228,7 +225,6 @@ def stream_useai(message):
     except Exception as e:
         yield f"Error: {e}"
 
-# 6. CHATPLUS (GPT-4o)
 def stream_chatplus(message):
     url = "https://chatplus.com/api/chat"
     headers = {
@@ -252,7 +248,6 @@ def stream_chatplus(message):
     except Exception as e:
         yield f"Error: {e}"
 
-# 7. DEEPAI
 def stream_deepai(message, model_name="DeepSeek V3.2"):
     url = "https://api.deepai.org/hacking_is_a_serious_crime"
     headers = {
@@ -270,7 +265,6 @@ def stream_deepai(message, model_name="DeepSeek V3.2"):
     except Exception as e:
         yield f"Error: {e}"
 
-# 8. AI HORDE
 def stream_horde(message):
     API_KEY = "0000000000"
     HEADERS = {
@@ -319,7 +313,6 @@ def stream_horde(message):
     except Exception as e:
         yield f"\nHorde Error: {e}"
 
-# 9. MICROSOFT COPILOT (Real-Time Async Token Streamer)
 def stream_copilot(message):
     q = queue.Queue()
     CHARS = "eEQqRXUu123456CcbBZzhj"
@@ -352,7 +345,7 @@ def stream_copilot(message):
         except Exception as e:
             q.put(f"[Error: {e}]")
         finally:
-            q.put(None)  # Sentinel to end stream
+            q.put(None)
 
     def worker():
         loop = asyncio.new_event_loop()
@@ -369,7 +362,6 @@ def stream_copilot(message):
             break
         yield chunk
 
-# 10. G4F
 def stream_g4f(message):
     try:
         response = g4f.ChatCompletion.create(
@@ -382,7 +374,6 @@ def stream_g4f(message):
     except Exception as e:
         yield f"G4F Error: {e}"
 
-# 11. OFFICIAL COMMERCIAL OPENAI STREAMER
 def stream_openai(messages, api_key, model="gpt-4o-mini"):
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
@@ -410,6 +401,67 @@ def stream_openai(messages, api_key, model="gpt-4o-mini"):
                         pass
     except Exception as e:
         yield f"[OpenAI Error: {e}]"
+
+# --- LEAD CATCHER ENGINE ---
+def send_lead_email(owner_email, lead_text, client_id):
+    """Fires an email via Resend in the background."""
+    if not owner_email or not resend.api_key:
+        print("⚠️ Email delivery skipped: Missing owner_email or RESEND_API_KEY")
+        return
+        
+    try:
+        resend.Emails.send({
+            "from": "Vincent AI <leads@vincentrasskazov.com.au>",
+            "to": owner_email,
+            "subject": f"🚨 New Lead Captured: {client_id}",
+            "html": f"""
+            <div style="font-family: sans-serif; padding: 20px;">
+                <h2 style="color: #2563eb;">New Lead Alert</h2>
+                <p>Your AI assistant just captured a new lead:</p>
+                <div style="background: #f3f4f6; padding: 15px; border-radius: 8px; font-size: 16px; font-weight: bold;">
+                    {lead_text}
+                </div>
+                <p style="color: #6b7280; font-size: 12px; margin-top: 20px;">Powered by Vincent Rasskazov AI</p>
+            </div>
+            """
+        })
+        print(f"✅ Lead email sent successfully to {owner_email}")
+    except Exception as e:
+        print(f"⚠️ Failed to send lead email: {e}")
+
+def intercept_leads(generator, owner_email, client_id):
+    """Wraps the text stream, hiding the ||LEAD|| tag from the user and triggering the email."""
+    accumulated = ""
+    for chunk in generator:
+        accumulated += chunk
+        
+        # Check if the AI is attempting to write a lead tag
+        if "||" in accumulated:
+            # If the full tag has been generated, extract it
+            if "||LEAD:" in accumulated and accumulated.count("||") >= 2:
+                start_idx = accumulated.find("||LEAD:")
+                end_idx = accumulated.find("||", start_idx + 2) + 2
+                
+                tag_string = accumulated[start_idx:end_idx]
+                lead_data = tag_string.replace("||LEAD:", "").replace("||", "").strip()
+                
+                # Fire the email off in a background thread so the chat doesn't freeze
+                threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id), daemon=True).start()
+                
+                # Erase the tag from the buffer so the customer never sees it
+                accumulated = accumulated.replace(tag_string, "")
+                yield accumulated
+                accumulated = ""
+        else:
+            # Safe to yield normally
+            yield accumulated
+            accumulated = ""
+            
+    # Yield any remaining text
+    if accumulated:
+        # Final safety check to strip partial tags
+        clean_final = re.sub(r'\|\|LEAD:.*?\|\|', '', accumulated)
+        yield clean_final
 
 # --- B2B CLIENT DATABASE HELPER ---
 def get_b2b_client(client_id):
@@ -514,7 +566,7 @@ def b2b_chat():
     data = request.json or {}
     client_id = data.get('client_id')
     user_message = data.get('message', '').strip()
-    history = data.get('history', [])  # e.g., [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+    history = data.get('history', [])
 
     if not client_id or not user_message:
         return jsonify({"error": "Missing client_id or message"}), 400
@@ -523,42 +575,40 @@ def b2b_chat():
     if not client_data or not client_data.get('is_active', False):
         return jsonify({"error": "Bot unavailable or inactive"}), 403
 
-    system_prompt = client_data.get('system_prompt', 'You are a helpful customer service assistant.')
+    system_prompt = client_data.get('system_prompt', 'You are a helpful assistant.')
     commercial_key = client_data.get('openai_api_key')
+    owner_email = client_data.get('owner_email') 
 
-    # 1. Official Commercial Route (If API Key exists in Firestore)
+    # Choose the engine
     if commercial_key:
         messages = [{"role": "system", "content": system_prompt}]
         for turn in history:
             messages.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
         messages.append({"role": "user", "content": user_message})
-        return Response(stream_with_context(stream_openai(messages, commercial_key)), mimetype='text/plain')
-
-    # 2. Demo Copilot Route (With 10k character truncation safeguard)
-    history_transcript = ""
-    for turn in history:
-        role = "Customer" if turn.get("role") == "user" else "Assistant"
-        history_transcript += f"{role}: {turn.get('content', '')}\n"
-
-    # Assemble and truncate strictly under 9,000 characters to prevent Copilot websocket timeouts
-    full_prompt = (
-        f"### System Instructions:\n{system_prompt}\n\n"
-        f"### Recent Conversation History:\n{history_transcript}\n"
-        f"Customer: {user_message}\n"
-        f"Assistant:"
-    )
-
-    if len(full_prompt) > 9000:
-        excess = len(full_prompt) - 9000
-        history_transcript = history_transcript[excess:]
+        base_stream = stream_openai(messages, commercial_key)
+    else:
+        history_transcript = ""
+        for turn in history:
+            role = "Customer" if turn.get("role") == "user" else "Assistant"
+            history_transcript += f"{role}: {turn.get('content', '')}\n"
+        
         full_prompt = (
             f"### System Instructions:\n{system_prompt}\n\n"
             f"### Recent Conversation History:\n{history_transcript}\n"
             f"Customer: {user_message}\n"
             f"Assistant:"
         )
+        if len(full_prompt) > 9000:
+            excess = len(full_prompt) - 9000
+            history_transcript = history_transcript[excess:]
+            full_prompt = f"### System Instructions:\n{system_prompt}\n\n### Recent Conversation History:\n{history_transcript}\nCustomer: {user_message}\nAssistant:"
+            
+        base_stream = stream_copilot(full_prompt)
 
-    return Response(stream_with_context(stream_copilot(full_prompt)), mimetype='text/plain')
+    # Wrap the chosen engine in the lead interceptor
+    secure_stream = intercept_leads(base_stream, owner_email, client_id)
+    
+    return Response(stream_with_context(secure_stream), mimetype='text/plain')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
