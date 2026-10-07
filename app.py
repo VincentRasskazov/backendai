@@ -186,19 +186,34 @@ def send_lead_email(owner_email, lead_text, client_id):
     """Sends the intercepted lead to the business owner via Resend."""
     if not owner_email or not resend.api_key:
         return
+        
+    # Split the tag into Name, Phone, and Summary based on the pipe symbol '|'
+    parts = [p.strip() for p in lead_text.split('|')]
+    
+    # If the AI perfectly followed instructions, we will have 3 parts
+    if len(parts) >= 3:
+        display_html = f"""
+            <p><b>Name:</b> {parts[0]}</p>
+            <p><b>Phone:</b> {parts[1]}</p>
+            <p><b>Job Details:</b> {parts[2]}</p>
+        """
+    else:
+        # Fallback just in case the AI messed up the formatting
+        display_html = f"<p><b>Lead Details:</b> {lead_text}</p>"
+
     try:
         resend.Emails.send({
             "from": "Vincent AI <leads@vincentrasskazov.com.au>",
             "to": owner_email,
-            "subject": f"🚨 New Lead Captured: {client_id}",
+            "subject": f"New Lead Captured: {client_id}",
             "html": f"""
-            <div style="font-family: sans-serif; padding: 20px;">
-                <h2 style="color: #2563eb;">New Lead Alert</h2>
-                <p>Your AI assistant just captured a new lead:</p>
-                <div style="background: #f3f4f6; padding: 15px; border-radius: 8px; font-size: 16px; font-weight: bold;">
-                    {lead_text}
+            <div style="font-family: sans-serif; padding: 20px; max-width: 600px;">
+                <h2 style="color: #2563eb; margin-bottom: 5px;">New Lead Alert</h2>
+                <p style="color: #4b5563; margin-top: 0;">Your AI assistant just captured a new lead.</p>
+                <div style="background: #f8fafc; padding: 20px; border-left: 4px solid #3b82f6; border-radius: 4px; font-size: 16px; margin-top: 20px;">
+                    {display_html}
                 </div>
-                <p style="color: #6b7280; font-size: 12px; margin-top: 20px;">Powered by Vincent Rasskazov AI</p>
+                <p style="color: #9ca3af; font-size: 12px; margin-top: 30px;">Powered by Vincent Rasskazov AI</p>
             </div>
             """
         })
