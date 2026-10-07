@@ -48,7 +48,7 @@ else:
 BACKEND_PUBLIC_URL = "https://backendai-ablv.onrender.com"
 resend.api_key = os.environ.get("RESEND_API_KEY")
 
-# --- RATE LIMITING (In-Memory) ---
+# --- RATE LIMITING (Memory Optimized for Render Free Tier) ---
 request_log = {}
 RATE_LIMIT_SECONDS = 3
 
@@ -58,13 +58,15 @@ def is_rate_limited(ip):
     if now - last_time < RATE_LIMIT_SECONDS:
         return True
     request_log[ip] = now
-    if len(request_log) > 1000:
-        cleanup_request_log()
+    
+    # Run cleanup only periodically to save CPU
+    if len(request_log) > 500:
+        cleanup_request_log(now)
     return False
 
-def cleanup_request_log():
-    now = time.time()
-    to_remove = [ip for ip, t in request_log.items() if now - t > 3600]
+def cleanup_request_log(current_time):
+    # Create a list of keys to delete to avoid dictionary size changing during iteration
+    to_remove = [ip for ip, t in request_log.items() if current_time - t > 3600]
     for ip in to_remove:
         del request_log[ip]
 
@@ -73,17 +75,18 @@ def keep_alive_worker():
     url = f"{BACKEND_PUBLIC_URL}/health"
     print(f"❤️ Heartbeat system active. Target: {url}")
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; VincentHealth/1.0; +https://vincentai.com)",
+        "User-Agent": "Mozilla/5.0 (compatible; VincentHealth/1.0)",
         "Accept": "*/*"
     }
     while True:
-        time.sleep(600)
+        time.sleep(840) # 14 minutes (Render sleeps after 15)
         try:
-            requests.get(url, headers=headers, timeout=10)
-            print(f"❤️ Heartbeat sent to {url}")
-        except Exception as e:
-            print(f"⚠️ Heartbeat failed: {e}")
+            requests.get(url, headers=headers, timeout=5)
+            print("❤️ Heartbeat successful")
+        except Exception:
+            pass
 
+# Start heartbeat daemon
 threading.Thread(target=keep_alive_worker, daemon=True).start()
 
 # --- PROVIDERS ---
@@ -194,13 +197,12 @@ def stream_notegpt(message):
 
 def stream_useai(message):
     url = "https://use.ai/v1/chat"
-    chat_id = str(uuid.uuid4())
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0"
     }
     payload = {
-        "chatId": chat_id,
+        "chatId": str(uuid.uuid4()),
         "selectedChatModel": "gateway-gpt-5",
         "selectedVisibilityType": "private",
         "message": {
@@ -227,10 +229,7 @@ def stream_useai(message):
 
 def stream_chatplus(message):
     url = "https://chatplus.com/api/chat"
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
     payload = {
         "id": "guest",
         "messages": [{"id": str(uuid.uuid4()), "role": "user", "content": message, "parts": [{"type": "text", "text": message}]}],
@@ -273,36 +272,33 @@ def stream_horde(message):
         "Client-Agent": "VincentAI:1.0:Anonymous"
     }
     submit_url = "https://stablehorde.net/api/v2/generate/text/async"
-    formatted_prompt = f"### Instruction:\n{message}\n### Response:\n"
     payload = {
-        "prompt": formatted_prompt,
+        "prompt": f"### Instruction:\n{message}\n### Response:\n",
         "params": {
-            "n": 1,
-            "max_context_length": 1024,
-            "max_length": 512,
-            "rep_pen": 1.1,
-            "temperature": 0.7,
+            "n": 1, "max_context_length": 1024, "max_length": 512,
+            "rep_pen": 1.1, "temperature": 0.7,
             "stop_sequence": ["### Instruction:", "User:", "### Input:"]
         },
         "models": []
     }
     try:
-        yield "Requesting GPU worker from Horde..."
+        yield "Requesting GPU worker..."
         submit_req = requests.post(submit_url, headers=HEADERS, json=payload, timeout=10)
         if submit_req.status_code != 202:
             yield f"\nError: Horde rejected ({submit_req.status_code})"
             return
+            
         job_id = submit_req.json()['id']
         status_url = f"https://stablehorde.net/api/v2/generate/text/status/{job_id}"
         start_time = time.time()
+        
         while True:
             if time.time() - start_time > 60:
                 yield "\nTimeout: No GPU picked up the job."
                 break
             check = requests.get(status_url, headers=HEADERS).json()
             if check['done']:
-                text = check['generations'][0]['text']
-                clean = text.replace("### Instruction:", "").replace("### Input:", "").strip()
+                clean = check['generations'][0]['text'].replace("### Instruction:", "").replace("### Input:", "").strip()
                 yield "\n" + clean
                 break
             if not check['is_possible']:
@@ -315,10 +311,8 @@ def stream_horde(message):
 
 def stream_copilot(message):
     q = queue.Queue()
-    CHARS = "eEQqRXUu123456CcbBZzhj"
-
     def generate_conversation_id():
-        return ''.join(random.choice(CHARS) for _ in range(21))
+        return ''.join(random.choice("eEQqRXUu123456CcbBZzhj") for _ in range(21))
 
     async def run_ws():
         ws_url = "wss://copilot.microsoft.com/c/api/chat?api-version=2&features=-%2Cncedge%2Cedgepagecontext&setflight=-%2Cncedge%2Cedgepagecontext&ncedge=1"
@@ -353,8 +347,7 @@ def stream_copilot(message):
         loop.run_until_complete(run_ws())
         loop.close()
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+    threading.Thread(target=worker, daemon=True).start()
 
     while True:
         chunk = q.get()
@@ -380,11 +373,7 @@ def stream_openai(messages, api_key, model="gpt-4o-mini"):
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True
-    }
+    payload = {"model": model, "messages": messages, "stream": True}
     try:
         with requests.post(url, json=payload, headers=headers, stream=True, timeout=30) as r:
             for line in r.iter_lines(decode_unicode=True):
@@ -404,9 +393,7 @@ def stream_openai(messages, api_key, model="gpt-4o-mini"):
 
 # --- LEAD CATCHER ENGINE ---
 def send_lead_email(owner_email, lead_text, client_id):
-    """Fires an email via Resend in the background."""
     if not owner_email or not resend.api_key:
-        print("⚠️ Email delivery skipped: Missing owner_email or RESEND_API_KEY")
         return
         
     try:
@@ -430,14 +417,12 @@ def send_lead_email(owner_email, lead_text, client_id):
         print(f"⚠️ Failed to send lead email: {e}")
 
 def intercept_leads(generator, owner_email, client_id):
-    """Wraps the text stream, hiding the ||LEAD|| tag from the user and triggering the email."""
+    """Wraps stream, hiding ||LEAD|| tags and avoiding freezes from markdown tables."""
     accumulated = ""
     for chunk in generator:
         accumulated += chunk
         
-        # Check if the AI is attempting to write a lead tag
         if "||" in accumulated:
-            # If the full tag has been generated, extract it
             if "||LEAD:" in accumulated and accumulated.count("||") >= 2:
                 start_idx = accumulated.find("||LEAD:")
                 end_idx = accumulated.find("||", start_idx + 2) + 2
@@ -445,23 +430,24 @@ def intercept_leads(generator, owner_email, client_id):
                 tag_string = accumulated[start_idx:end_idx]
                 lead_data = tag_string.replace("||LEAD:", "").replace("||", "").strip()
                 
-                # Fire the email off in a background thread so the chat doesn't freeze
                 threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id), daemon=True).start()
                 
-                # Erase the tag from the buffer so the customer never sees it
                 accumulated = accumulated.replace(tag_string, "")
+                if accumulated:
+                    yield accumulated
+                accumulated = ""
+                
+            # Safety release: if buffer holds characters but doesn't form a lead tag
+            elif len(accumulated) > 35:
                 yield accumulated
                 accumulated = ""
         else:
-            # Safe to yield normally
-            yield accumulated
+            if accumulated:
+                yield accumulated
             accumulated = ""
             
-    # Yield any remaining text
     if accumulated:
-        # Final safety check to strip partial tags
-        clean_final = re.sub(r'\|\|LEAD:.*?\|\|', '', accumulated)
-        yield clean_final
+        yield re.sub(r'\|\|LEAD:.*?\|\|', '', accumulated)
 
 # --- B2B CLIENT DATABASE HELPER ---
 def get_b2b_client(client_id):
@@ -483,19 +469,17 @@ def health():
 @app.route('/notify', methods=['POST'])
 def notify():
     if not firebase_admin._apps:
-        return jsonify({"error": "Firebase Admin not configured on server"}), 500
+        return jsonify({"error": "Firebase Admin not configured"}), 500
 
     data = request.json or {}
     token = data.get('fcmToken')
-    title = data.get('title', 'New Message')
-    body = data.get('body', 'You have a new message.')
-
+    
     if not token:
         return jsonify({"error": "Missing fcmToken"}), 400
 
     try:
         msg = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
+            notification=messaging.Notification(title=data.get('title', 'Alert'), body=data.get('body', 'Message')),
             token=token,
         )
         response = messaging.send(msg)
@@ -510,51 +494,35 @@ def chat():
         return jsonify({"error": "Rate limit exceeded. Wait 3s."}), 429
 
     data = request.json or {}
-
     student_data = data.get('studentData')
+    
     if student_data and firebase_admin._apps:
         try:
-            db = firestore.client()
             student_data['timestamp'] = firestore.SERVER_TIMESTAMP
-            db.collection('insyd_survey_submissions').add(student_data)
-            print("✅ Survey data saved to Firestore!")
-        except Exception as e:
-            print(f"⚠️ Failed to save to Firestore: {e}")
+            firestore.client().collection('insyd_survey_submissions').add(student_data)
+        except Exception:
+            pass
 
     message = data.get('message', '')
     model_key = data.get('model', 'venice')
 
-    if model_key == "venice":
-        return Response(stream_with_context(stream_venice(message)), mimetype='text/plain')
-    elif model_key == "overchat":
-        return Response(stream_with_context(stream_overchat(message)), mimetype='text/plain')
-    elif model_key == "talkai":
-        return Response(stream_with_context(stream_talkai(message)), mimetype='text/plain')
-    elif model_key == "notegpt":
-        return Response(stream_with_context(stream_notegpt(message)), mimetype='text/plain')
-    elif model_key == "useai":
-        return Response(stream_with_context(stream_useai(message)), mimetype='text/plain')
-    elif model_key == "chatplus":
-        return Response(stream_with_context(stream_chatplus(message)), mimetype='text/plain')
-    elif model_key == "horde":
-        return Response(stream_with_context(stream_horde(message)), mimetype='text/plain')
-    elif model_key == "copilot":
-        return Response(stream_with_context(stream_copilot(message)), mimetype='text/plain')
-    elif model_key == "g4f":
-        return Response(stream_with_context(stream_g4f(message)), mimetype='text/plain')
-    elif model_key.startswith("deepai-"):
-        deepai_map = {
-            "deepai-deepseek": "DeepSeek V3.2",
-            "deepai-llama": "Llama 3.3 70B Instruct",
-            "deepai-qwen": "Qwen3 30B",
-            "deepai-4omini": "GPT-4o mini",
-            "deepai-gemma3": "Gemma 3 12B",
-            "deepai-gemma2": "Gemma2 9B",
+    provider_map = {
+        "venice": stream_venice, "overchat": stream_overchat, "talkai": stream_talkai,
+        "notegpt": stream_notegpt, "useai": stream_useai, "chatplus": stream_chatplus,
+        "horde": stream_horde, "copilot": stream_copilot, "g4f": stream_g4f
+    }
+    
+    if model_key.startswith("deepai-"):
+        deepai_models = {
+            "deepai-deepseek": "DeepSeek V3.2", "deepai-llama": "Llama 3.3 70B Instruct",
+            "deepai-qwen": "Qwen3 30B", "deepai-4omini": "GPT-4o mini",
+            "deepai-gemma3": "Gemma 3 12B", "deepai-gemma2": "Gemma2 9B",
             "deepai-4nano": "GPT-4.1 Nano"
         }
-        return Response(stream_with_context(stream_deepai(message, deepai_map.get(model_key, "DeepSeek V3.2"))), mimetype='text/plain')
-    else:
-        return Response(stream_with_context(stream_venice(message)), mimetype='text/plain')
+        return Response(stream_with_context(stream_deepai(message, deepai_models.get(model_key, "DeepSeek V3.2"))), mimetype='text/plain')
+        
+    stream_func = provider_map.get(model_key, stream_venice)
+    return Response(stream_with_context(stream_func(message)), mimetype='text/plain')
 
 # --- DEDICATED MULTI-TENANT B2B ROUTE ---
 @app.route('/b2b/chat', methods=['POST'])
@@ -579,35 +547,22 @@ def b2b_chat():
     commercial_key = client_data.get('openai_api_key')
     owner_email = client_data.get('owner_email') 
 
-    # Choose the engine
     if commercial_key:
         messages = [{"role": "system", "content": system_prompt}]
-        for turn in history:
+        for turn in history[-6:]: # Keep only last 6 messages to save memory/tokens
             messages.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
         messages.append({"role": "user", "content": user_message})
         base_stream = stream_openai(messages, commercial_key)
     else:
         history_transcript = ""
-        for turn in history:
+        for turn in history[-6:]: # Truncate history context to save memory
             role = "Customer" if turn.get("role") == "user" else "Assistant"
             history_transcript += f"{role}: {turn.get('content', '')}\n"
         
-        full_prompt = (
-            f"### System Instructions:\n{system_prompt}\n\n"
-            f"### Recent Conversation History:\n{history_transcript}\n"
-            f"Customer: {user_message}\n"
-            f"Assistant:"
-        )
-        if len(full_prompt) > 9000:
-            excess = len(full_prompt) - 9000
-            history_transcript = history_transcript[excess:]
-            full_prompt = f"### System Instructions:\n{system_prompt}\n\n### Recent Conversation History:\n{history_transcript}\nCustomer: {user_message}\nAssistant:"
-            
+        full_prompt = f"### System Instructions:\n{system_prompt}\n\n### Recent Conversation History:\n{history_transcript}\nCustomer: {user_message}\nAssistant:"
         base_stream = stream_copilot(full_prompt)
 
-    # Wrap the chosen engine in the lead interceptor
     secure_stream = intercept_leads(base_stream, owner_email, client_id)
-    
     return Response(stream_with_context(secure_stream), mimetype='text/plain')
 
 if __name__ == '__main__':
