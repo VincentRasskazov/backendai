@@ -26,7 +26,6 @@ CORS(app)
 FIREBASE_PROJECT_ID = "aiproject-67"
 firebase_cred_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
 
-# Initialize Firebase securely. If on Render, it uses the environment variable.
 if firebase_cred_json:
     try:
         cred_dict = json.loads(firebase_cred_json)
@@ -51,32 +50,28 @@ BACKEND_PUBLIC_URL = "https://backendai-ablv.onrender.com"
 resend.api_key = os.environ.get("RESEND_API_KEY")
 
 # ==========================================
-# 2. SERVER OPTIMIZATIONS (Rate Limits & Keep-Alive)
+# 2. SERVER OPTIMIZATIONS
 # ==========================================
 request_log = {}
 RATE_LIMIT_SECONDS = 3
 
 def is_rate_limited(ip):
-    """Prevents spam by limiting IPs. Optimized for Render's free tier RAM limits."""
     now = time.time()
     last_time = request_log.get(ip, 0)
     if now - last_time < RATE_LIMIT_SECONDS:
         return True
     request_log[ip] = now
     
-    # Only clean the dictionary if it gets too large to save CPU
     if len(request_log) > 500:
         cleanup_request_log(now)
     return False
 
 def cleanup_request_log(current_time):
-    # Create list of old IPs to delete
     to_remove = [ip for ip, t in request_log.items() if current_time - t > 3600]
     for ip in to_remove:
         del request_log[ip]
 
 def keep_alive_worker():
-    """Pings the server every 14 mins to prevent Render from sleeping."""
     url = f"{BACKEND_PUBLIC_URL}/health"
     headers = {"User-Agent": "VincentHealth/1.0", "Accept": "*/*"}
     while True:
@@ -107,9 +102,7 @@ LEAD CAPTURE RULES:
 # ==========================================
 # 4. AI PROVIDERS (Streaming Functions)
 # ==========================================
-# (Standard providers omitted for brevity, keeping the main ones used by B2B)
 def stream_copilot(message):
-    """Connects to free demo AI via websockets."""
     q = queue.Queue()
     def generate_conversation_id():
         return ''.join(random.choice("eEQqRXUu123456CcbBZzhj") for _ in range(21))
@@ -136,8 +129,8 @@ def stream_copilot(message):
                             break
                     except asyncio.TimeoutError:
                         break
-        except Exception as e:
-            q.put(f"[Error: {e}]")
+        except Exception:
+            q.put("\n\n*The connection was interrupted. Please ask your question again.*")
         finally:
             q.put(None)
 
@@ -155,7 +148,6 @@ def stream_copilot(message):
         yield chunk
 
 def stream_openai(messages, api_key, model="gpt-4o-mini"):
-    """Commercial AI engine for paid clients."""
     url = "https://api.openai.com/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -176,21 +168,18 @@ def stream_openai(messages, api_key, model="gpt-4o-mini"):
                             yield content
                     except:
                         pass
-    except Exception as e:
-        yield f"[OpenAI Error: {e}]"
+    except Exception:
+        yield "\n\n*Connection error. Please try again.*"
 
 # ==========================================
-# 5. LEAD CATCHER ENGINE
+# 5. LEAD CATCHER ENGINE (State-Machine Buffer)
 # ==========================================
 def send_lead_email(owner_email, lead_text, client_id):
-    """Sends the intercepted lead to the business owner via Resend."""
     if not owner_email or not resend.api_key:
         return
         
-    # Split the tag into Name, Phone, and Summary based on the pipe symbol '|'
     parts = [p.strip() for p in lead_text.split('|')]
     
-    # If the AI perfectly followed instructions, we will have 3 parts
     if len(parts) >= 3:
         display_html = f"""
             <p><b>Name:</b> {parts[0]}</p>
@@ -198,7 +187,6 @@ def send_lead_email(owner_email, lead_text, client_id):
             <p><b>Job Details:</b> {parts[2]}</p>
         """
     else:
-        # Fallback just in case the AI messed up the formatting
         display_html = f"<p><b>Lead Details:</b> {lead_text}</p>"
 
     try:
@@ -222,42 +210,72 @@ def send_lead_email(owner_email, lead_text, client_id):
         print(f"⚠️ Failed to send lead email: {e}")
 
 def intercept_leads(generator, owner_email, client_id):
-    """
-    Wraps the AI text stream. Hides ||LEAD|| tags from the user interface 
-    and triggers the email dispatch in the background. Safely handles Markdown.
-    """
-    accumulated = ""
+    buffer = ""
+    inside_tag = False
+    
     for chunk in generator:
-        accumulated += chunk
+        buffer += chunk
         
-        if "||" in accumulated:
-            if "||LEAD:" in accumulated and accumulated.count("||") >= 2:
-                start_idx = accumulated.find("||LEAD:")
-                end_idx = accumulated.find("||", start_idx + 2) + 2
+        if not inside_tag:
+            if "||" in buffer:
+                # We positively identify the start of a lead tag
+                if "||LEAD:" in buffer:
+                    inside_tag = True
+                    start_idx = buffer.find("||LEAD:")
+                    if start_idx > 0:
+                        yield buffer[:start_idx]
+                    buffer = buffer[start_idx:]
+                else:
+                    # We have double pipes, check if it's building "LEAD:" character by character
+                    idx = buffer.find("||")
+                    after_pipes = buffer[idx+2:]
+                    
+                    if "LEAD:".startswith(after_pipes):
+                        # It's a partial match (e.g. ||L or ||LEA). Hold it safely.
+                        if idx > 0:
+                            yield buffer[:idx]
+                            buffer = buffer[idx:]
+                    else:
+                        # False alarm (e.g. regular markdown table). Release immediately.
+                        yield buffer[:idx+2]
+                        buffer = buffer[idx+2:]
+                        
+            # If the chunk ends with a single pipe, hold just the pipe in case the next chunk is the second pipe
+            elif buffer.endswith("|"):
+                if len(buffer) > 1:
+                    yield buffer[:-1]
+                buffer = "|"
+            else:
+                # Entirely safe text, stream it to the user
+                yield buffer
+                buffer = ""
                 
-                tag_string = accumulated[start_idx:end_idx]
+        else:
+            # We are locked inside the tag, waiting for the closing ||
+            if "||" in buffer[2:]: 
+                end_idx = buffer.find("||", 2) + 2
+                tag_string = buffer[:end_idx]
+                
                 lead_data = tag_string.replace("||LEAD:", "").replace("||", "").strip()
-                
-                # Fire email in a separate thread so chat doesn't lag
                 threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id), daemon=True).start()
                 
-                # Erase tag from stream
-                accumulated = accumulated.replace(tag_string, "")
-                if accumulated:
-                    yield accumulated
-                accumulated = ""
-                
-            # Anti-freeze: If buffer holds normal markdown table pipes but no lead tag, release it
-            elif len(accumulated) > 35:
-                yield accumulated
-                accumulated = ""
+                buffer = buffer[end_idx:]
+                inside_tag = False
+            elif len(buffer) > 500:
+                # Failsafe abort if the AI forgets to close the tag
+                yield buffer
+                buffer = ""
+                inside_tag = False
+
+    # Stream finished
+    if buffer:
+        if inside_tag:
+            # Emergency Salvage: AI disconnected mid-tag. Email what we have and hide the broken code.
+            lead_data = buffer.replace("||LEAD:", "").replace("||", "").strip()
+            if lead_data:
+                threading.Thread(target=send_lead_email, args=(owner_email, lead_data + " [Incomplete]", client_id), daemon=True).start()
         else:
-            if accumulated:
-                yield accumulated
-            accumulated = ""
-            
-    if accumulated:
-        yield re.sub(r'\|\|LEAD:.*?\|\|', '', accumulated)
+            yield buffer
 
 # ==========================================
 # 6. ROUTERS
@@ -291,7 +309,6 @@ def b2b_chat():
     if not client_id or not user_message:
         return jsonify({"error": "Missing client_id or message"}), 400
 
-    # Fetch specific business knowledge from Firebase
     client_data = get_b2b_client(client_id)
     if not client_data or not client_data.get('is_active', False):
         return jsonify({"error": "Bot unavailable or inactive"}), 403
@@ -300,36 +317,28 @@ def b2b_chat():
     commercial_key = client_data.get('openai_api_key')
     owner_email = client_data.get('owner_email') 
 
-    # Combine Base Rules with Business Knowledge
     full_system_instruction = f"{BASE_SYSTEM_PROMPT}\n\n--- BUSINESS DATA ---\n{business_knowledge}\n-------------------"
 
     if commercial_key:
-        # PAID TIER: OpenAI has higher limits. Pass system instructions normally.
         messages = [{"role": "system", "content": full_system_instruction}]
-        for turn in history[-10:]: # Keep last 10 messages
+        for turn in history[-10:]:
             messages.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
         messages.append({"role": "user", "content": user_message})
         base_stream = stream_openai(messages, commercial_key)
         
     else:
-        # FREE DEMO TIER: Copilot has a strict ~10,000 character limit.
-        # We must build the prompt carefully to avoid crashing the model.
         history_transcript = ""
         temp_history = []
-        
-        # Calculate base lengths
         current_len = len(full_system_instruction) + len(user_message)
         
-        # Loop backwards through history so we always keep the newest context first
         for turn in reversed(history):
             role = "Customer" if turn.get("role") == "user" else "Assistant"
             line = f"{role}: {turn.get('content', '')}\n"
             
-            # Stop adding history if we cross 8500 chars (leaves 1500 chars breathing room)
             if current_len + len(line) > 8500:
                 break
                 
-            temp_history.insert(0, line) # Insert at front to maintain chronological order
+            temp_history.insert(0, line)
             current_len += len(line)
             
         history_transcript = "".join(temp_history)
@@ -341,7 +350,6 @@ def b2b_chat():
         )
         base_stream = stream_copilot(full_prompt)
 
-    # Wrap the engine stream in the lead catcher
     secure_stream = intercept_leads(base_stream, owner_email, client_id)
     return Response(stream_with_context(secure_stream), mimetype='text/plain')
 
