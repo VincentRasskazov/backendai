@@ -88,19 +88,21 @@ threading.Thread(target=keep_alive_worker, daemon=True).start()
 # ==========================================
 BASE_SYSTEM_PROMPT = """You are a helpful, professional virtual assistant for a business.
 Your goal is to answer customer questions accurately using ONLY the 'Business Data' provided below. 
-Do not make up services, prices, or locations that are not in the Business Data.
+If the answer is not in the Business Data, politely say you don't know and ask for their phone number so the team can call them. DO NOT make up prices, services, or facts.
 
 LEAD CAPTURE RULES:
-1. Be conversational. Ask questions to figure out what specific service the customer needs if they haven't told you yet.
-2. Once you know what they need, gently ask for their name and phone number to arrange a callback or quote.
+1. Be conversational. Ask questions to figure out what specific service the customer needs.
+2. Once you know what they need, gently ask for their name and phone number to arrange a callback.
 3. As soon as they provide their name and phone number, you MUST output a secret tracking tag summarizing the lead.
    Format the tag EXACTLY like this with pipe symbols: ||LEAD: Name | Phone | Brief summary of what they need||
-   Example: ||LEAD: John Doe | 0412 345 678 | Customer has a leaking roof and wants a price estimate||
-4. After outputting the tag, warmly thank the customer and tell them the team will call them shortly. Do not mention the tag to the user.
+   CRITICAL: ONLY OUTPUT THIS TAG EXACTLY ONCE. If you have already thanked them for their details in a previous message, DO NOT output the tag again.
+4. After outputting the tag, warmly thank the customer and tell them the team will call them shortly.
+
+CRITICAL RESTRICTION: You are the Assistant. Only generate the Assistant's reply. NEVER write dialogue for the Customer.
 """
 
 # ==========================================
-# 4. AI PROVIDERS (Streaming Functions)
+# 4. AI PROVIDERS
 # ==========================================
 def stream_copilot(message):
     q = queue.Queue()
@@ -172,7 +174,7 @@ def stream_openai(messages, api_key, model="gpt-4o-mini"):
         yield "\n\n*Connection error. Please try again.*"
 
 # ==========================================
-# 5. LEAD CATCHER ENGINE (State-Machine Buffer)
+# 5. LEAD CATCHER ENGINE (Anti-Spam Locked)
 # ==========================================
 def send_lead_email(owner_email, lead_text, client_id):
     if not owner_email or not resend.api_key:
@@ -212,13 +214,13 @@ def send_lead_email(owner_email, lead_text, client_id):
 def intercept_leads(generator, owner_email, client_id):
     buffer = ""
     inside_tag = False
+    email_sent = False # HARD LOCK: Max 1 email per user message
     
     for chunk in generator:
         buffer += chunk
         
         if not inside_tag:
             if "||" in buffer:
-                # We positively identify the start of a lead tag
                 if "||LEAD:" in buffer:
                     inside_tag = True
                     start_idx = buffer.find("||LEAD:")
@@ -226,54 +228,49 @@ def intercept_leads(generator, owner_email, client_id):
                         yield buffer[:start_idx]
                     buffer = buffer[start_idx:]
                 else:
-                    # We have double pipes, check if it's building "LEAD:" character by character
                     idx = buffer.find("||")
                     after_pipes = buffer[idx+2:]
                     
                     if "LEAD:".startswith(after_pipes):
-                        # It's a partial match (e.g. ||L or ||LEA). Hold it safely.
                         if idx > 0:
                             yield buffer[:idx]
                             buffer = buffer[idx:]
                     else:
-                        # False alarm (e.g. regular markdown table). Release immediately.
                         yield buffer[:idx+2]
                         buffer = buffer[idx+2:]
                         
-            # If the chunk ends with a single pipe, hold just the pipe in case the next chunk is the second pipe
             elif buffer.endswith("|"):
                 if len(buffer) > 1:
                     yield buffer[:-1]
                 buffer = "|"
             else:
-                # Entirely safe text, stream it to the user
                 yield buffer
                 buffer = ""
                 
         else:
-            # We are locked inside the tag, waiting for the closing ||
             if "||" in buffer[2:]: 
                 end_idx = buffer.find("||", 2) + 2
                 tag_string = buffer[:end_idx]
-                
                 lead_data = tag_string.replace("||LEAD:", "").replace("||", "").strip()
-                threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id), daemon=True).start()
+                
+                # ONLY fire if we haven't sent one for this specific chat burst yet
+                if not email_sent:
+                    threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id), daemon=True).start()
+                    email_sent = True
                 
                 buffer = buffer[end_idx:]
                 inside_tag = False
             elif len(buffer) > 500:
-                # Failsafe abort if the AI forgets to close the tag
                 yield buffer
                 buffer = ""
                 inside_tag = False
 
-    # Stream finished
     if buffer:
         if inside_tag:
-            # Emergency Salvage: AI disconnected mid-tag. Email what we have and hide the broken code.
             lead_data = buffer.replace("||LEAD:", "").replace("||", "").strip()
-            if lead_data:
+            if lead_data and not email_sent:
                 threading.Thread(target=send_lead_email, args=(owner_email, lead_data + " [Incomplete]", client_id), daemon=True).start()
+                email_sent = True
         else:
             yield buffer
 
@@ -343,9 +340,11 @@ def b2b_chat():
             
         history_transcript = "".join(temp_history)
         
+        # PROMPT INVERSION FIX: System instructions go at the BOTTOM so the AI doesn't forget them.
         full_prompt = (
-            f"### System Instructions:\n{full_system_instruction}\n\n"
-            f"### Conversation History:\n{history_transcript}\n"
+            f"### Past Conversation:\n{history_transcript}\n\n"
+            f"### System Instructions & Data:\n{full_system_instruction}\n\n"
+            f"CRITICAL: Respond to the Customer's latest message based ONLY on the Business Data above. DO NOT write the Customer's response.\n"
             f"Customer: {user_message}\nAssistant:"
         )
         base_stream = stream_copilot(full_prompt)
