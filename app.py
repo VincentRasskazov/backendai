@@ -19,8 +19,6 @@ from firebase_admin import credentials, messaging, firestore
 
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
-
 # ==========================================
 # 1. DATABASE & API SETUP
 # ==========================================
@@ -282,21 +280,51 @@ def intercept_leads(generator, owner_email, client_id):
 # ==========================================
 mcp_sessions = {}
 
-# 1. Provide OAuth Discovery so Gemini knows this is a valid server
+# 1. Bulletproof Global CORS Handler
+@app.after_request
+def apply_cors(response):
+    origin = request.headers.get('Origin')
+    if origin:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    else:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-mcp-session'
+    return response
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    return '', 204
+
+# 2. Provide OAuth Discovery so Gemini validates the URL
 @app.route('/.well-known/oauth-authorization-server', methods=['GET'])
 @app.route('/.well-known/openid-configuration', methods=['GET'])
+@app.route('/mcp/.well-known/oauth-authorization-server', methods=['GET']) # Fallback if Gemini appends to URL
 def well_known_discovery():
-    metadata = {
+    return jsonify({
         "issuer": BACKEND_PUBLIC_URL,
         "authorization_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/auth",
         "token_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/token",
+        "registration_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"]
-    }
-    return jsonify(metadata)
+        "token_endpoint_auth_methods_supported": ["none"]
+    })
 
-# 2. Main MCP stream
+# 3. Dynamic Registration Endpoint (Required by Gemini UI)
+@app.route('/oauth/register', methods=['POST'])
+def oauth_register():
+    return jsonify({
+        "client_id": "gemini_client",
+        "client_secret": "gemini_secret",
+        "client_id_issued_at": int(time.time()),
+        "client_secret_expires_at": 0
+    }), 201
+
+# 4. Main MCP stream
 @app.route('/mcp', methods=['GET'])
 def mcp_sse():
     session_id = str(uuid.uuid4())
@@ -311,17 +339,19 @@ def mcp_sse():
         while True:
             try:
                 message = q.get(timeout=15)
-                # CRITICAL FIX: Add explicit event: message
                 yield f"event: message\ndata: {json.dumps(message)}\n\n"
             except queue.Empty:
                 yield ": keepalive\n\n"
 
-    response = Response(stream_with_context(generate()), mimetype="text/event-stream")
+    response = Response(stream_with_context(generate()))
+    # Force exact MIME type without utf-8 charset
+    response.headers['Content-Type'] = 'text/event-stream'
     response.headers['Cache-Control'] = 'no-cache, no-transform'
     response.headers['X-Accel-Buffering'] = 'no'
+    response.headers['Connection'] = 'keep-alive'
     return response
 
-# 3. Message endpoint for JSON-RPC
+# 5. Message endpoint for JSON-RPC
 @app.route('/mcp/message', methods=['POST'])
 def mcp_message():
     session_id = request.args.get('session_id')
@@ -329,8 +359,7 @@ def mcp_message():
     method = req.get("method")
     msg_id = req.get("id")
 
-    # Handle notifications which do not require a JSON-RPC response body
-    if method == "notifications/initialized":
+    if not msg_id and method == "notifications/initialized":
         return '', 202
 
     response = {"jsonrpc": "2.0", "id": msg_id}
@@ -398,9 +427,7 @@ def mcp_message():
     else:
         return jsonify(response)
 
-# ------------------------------------------
-# Dummy OAuth Bypasses for Gemini UI
-# ------------------------------------------
+# 6. Dummy OAuth Bypasses
 @app.route('/oauth/auth', methods=['GET'])
 def oauth_auth():
     redirect_uri = request.args.get('redirect_uri')
