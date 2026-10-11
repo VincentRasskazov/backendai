@@ -351,32 +351,32 @@ def mcp_message():
         response["result"] = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.0"}
+            "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.1"}
         }
     elif method == "tools/list":
         response["result"] = {
             "tools": [
                 {
-                    "name": "get_client_data",
-                    "description": "Read business_data, owner_email, and is_active for a client.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {"client_id": {"type": "string"}},
-                        "required": ["client_id"]
-                    }
-                },
-                {
-                    "name": "upsert_client_data",
-                    "description": "Create or update a client in the database.",
+                    "name": "batch_process_clients",
+                    "description": "Send multiple clients at once. The server will check if they exist and only add new ones.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "client_id": {"type": "string"},
-                            "business_data": {"type": "string"},
-                            "owner_email": {"type": "string"},
-                            "is_active": {"type": "boolean"}
+                            "clients": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "client_id": {"type": "string"},
+                                        "business_data": {"type": "string"},
+                                        "owner_email": {"type": "string"},
+                                        "is_active": {"type": "boolean"}
+                                    },
+                                    "required": ["client_id", "business_data", "owner_email"]
+                                }
+                            }
                         },
-                        "required": ["client_id", "business_data", "owner_email"]
+                        "required": ["clients"]
                     }
                 }
             ]
@@ -388,15 +388,22 @@ def mcp_message():
         db = firestore.client()
         
         try:
-            if tool_name == "get_client_data":
-                doc = db.collection('b2b_clients').document(args["client_id"]).get()
-                content = json.dumps(doc.to_dict(), indent=2) if doc.exists else "Client not found."
-                response["result"] = {"content": [{"type": "text", "text": content}]}
+            if tool_name == "batch_process_clients":
+                clients_list = args.get("clients", [])
+                results = []
+                for client in clients_list:
+                    client_id = client.get("client_id")
+                    doc_ref = db.collection('b2b_clients').document(client_id)
+                    
+                    if doc_ref.get().exists:
+                        results.append(f"Skipped {client_id}: Already exists in database.")
+                    else:
+                        client_data = client.copy()
+                        client_data.pop("client_id", None)
+                        doc_ref.set(client_data, merge=True)
+                        results.append(f"Success: {client_id} added.")
                 
-            elif tool_name == "upsert_client_data":
-                client_id = args.pop("client_id")
-                db.collection('b2b_clients').document(client_id).set(args, merge=True)
-                response["result"] = {"content": [{"type": "text", "text": f"Success: {client_id} saved to Firestore."}]}
+                response["result"] = {"content": [{"type": "text", "text": "\n".join(results)}]}
             else:
                 response["error"] = {"code": -32601, "message": "Tool not found"}
         except Exception as e:
