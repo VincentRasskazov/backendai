@@ -282,22 +282,17 @@ def intercept_leads(generator, owner_email, client_id):
 # ==========================================
 mcp_sessions = {}
 
-@app.route('/mcp', methods=['GET', 'OPTIONS'])
+@app.route('/mcp', methods=['GET'])
 def mcp_sse():
     """SSE endpoint for Gemini MCP Connection"""
-    # 1. Handle Gemini's strict CORS pre-flight check
-    if request.method == 'OPTIONS':
-        return '', 204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': '*'
-        }
-        
     session_id = str(uuid.uuid4())
     q = queue.Queue()
     mcp_sessions[session_id] = q
 
     def generate():
+        # Force flush through Render's proxy buffers so Gemini doesn't time out
+        yield ": start\n\n"
+        
         post_url = f"{BACKEND_PUBLIC_URL}/mcp/message?session_id={session_id}"
         yield f"event: endpoint\ndata: {post_url}\n\n"
         
@@ -309,23 +304,15 @@ def mcp_sse():
                 yield ": keepalive\n\n"
 
     response = Response(stream_with_context(generate()), mimetype="text/event-stream")
-    # 2. Force Render to stop buffering the stream
-    response.headers['Cache-Control'] = 'no-cache'
-    response.headers['X-Accel-Buffering'] = 'no' 
+    # Headers to completely disable Render buffering
+    response.headers['Cache-Control'] = 'no-cache, no-transform'
+    response.headers['X-Accel-Buffering'] = 'no'
     response.headers['Connection'] = 'keep-alive'
-    response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-@app.route('/mcp/message', methods=['POST', 'OPTIONS'])
+@app.route('/mcp/message', methods=['POST'])
 def mcp_message():
     """Handles incoming JSON-RPC tool calls from Gemini"""
-    if request.method == 'OPTIONS':
-        return '', 204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'POST, OPTIONS',
-            'Access-Control-Allow-Headers': '*'
-        }
-        
     session_id = request.args.get('session_id')
     req = request.json or {}
     method = req.get("method")
@@ -340,7 +327,7 @@ def mcp_message():
             "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.0"}
         }
     elif method == "notifications/initialized":
-        return "", 202, {'Access-Control-Allow-Origin': '*'}
+        return "", 202
     elif method == "tools/list":
         response["result"] = {
             "tools": [
@@ -394,11 +381,9 @@ def mcp_message():
 
     if session_id in mcp_sessions and msg_id is not None:
         mcp_sessions[session_id].put(response)
-        return "", 202, {'Access-Control-Allow-Origin': '*'}
+        return "", 202
     else:
-        resp = jsonify(response)
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        return resp
+        return jsonify(response)
 # ==========================================
 # 7. ROUTERS
 # ==========================================
