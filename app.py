@@ -190,6 +190,9 @@ def send_lead_email(owner_email, lead_text, client_id):
     else:
         display_html = f"<p><b>Lead Details:</b> {lead_text}</p>"
 
+    # Generates the custom URL for this specific client
+    logs_url = f"https://vincentrasskazov.com.au/ai/logs.html?client={client_id}"
+
     try:
         resend.Emails.send({
             "from": "Vincent AI <leads@vincentrasskazov.com.au>",
@@ -199,10 +202,13 @@ def send_lead_email(owner_email, lead_text, client_id):
             <div style="font-family: sans-serif; padding: 20px; max-width: 600px;">
                 <h2 style="color: #2563eb; margin-bottom: 5px;">New Lead Alert</h2>
                 <p style="color: #4b5563; margin-top: 0;">Your AI assistant just captured a new lead.</p>
-                <div style="background: #f8fafc; padding: 20px; border-left: 4px solid #3b82f6; border-radius: 4px; font-size: 16px; margin-top: 20px;">
+                <div style="background: #f8fafc; padding: 20px; border-left: 4px solid #3b82f6; border-radius: 4px; font-size: 16px; margin-top: 20px; margin-bottom: 25px;">
                     {display_html}
                 </div>
-                <p style="color: #9ca3af; font-size: 12px; margin-top: 30px;">Powered by Vincent Rasskazov AI</p>
+                
+                <a href="{logs_url}" style="background-color: #111827; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">View Chat Transcript</a>
+                
+                <p style="color: #9ca3af; font-size: 12px; margin-top: 40px; border-top: 1px solid #e5e7eb; padding-top: 15px;">Powered by Vincent Rasskazov AI</p>
             </div>
             """
         })
@@ -444,6 +450,37 @@ def get_b2b_client(client_id):
     except Exception as e:
         print(f"⚠️ Error reading Firestore: {e}")
         return None
+
+@app.route('/b2b/logs', methods=['GET'])
+def get_chat_logs():
+    client_id = request.args.get('client_id')
+    if not client_id:
+        return jsonify({"error": "Missing client_id parameter"}), 400
+        
+    if not firebase_admin._apps:
+        return jsonify({"error": "Database not configured"}), 500
+        
+    try:
+        db = firestore.client()
+        # Fetch logs ordered from oldest to newest
+        logs_ref = db.collection('b2b_clients').document(client_id).collection('chat_logs').order_by('timestamp')
+        docs = logs_ref.get()
+        
+        logs = []
+        for doc in docs:
+            data = doc.to_dict()
+            # Convert Firestore timestamp to a readable string format for the web
+            if 'timestamp' in data and data['timestamp']:
+                try:
+                    data['timestamp'] = data['timestamp'].isoformat()
+                except:
+                    data['timestamp'] = str(data['timestamp'])
+            logs.append(data)
+            
+        return jsonify({"client_id": client_id, "logs": logs})
+    except Exception as e:
+        print(f"⚠️ Error reading logs: {e}")
+        return jsonify({"error": "Failed to fetch logs"}), 500
 
 # --- NEW CHAT LOGGING FUNCTIONS ---
 def log_chat_message(client_id, role, content):
