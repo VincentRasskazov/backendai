@@ -277,37 +277,55 @@ def intercept_leads(generator, owner_email, client_id):
 
 
 
-
 # ==========================================
 # 6. MCP SERVER (GEMINI INTEGRATION)
 # ==========================================
 mcp_sessions = {}
 
-@app.route('/mcp', methods=['GET'])
+@app.route('/mcp', methods=['GET', 'OPTIONS'])
 def mcp_sse():
     """SSE endpoint for Gemini MCP Connection"""
+    # 1. Handle Gemini's strict CORS pre-flight check
+    if request.method == 'OPTIONS':
+        return '', 204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS',
+            'Access-Control-Allow-Headers': '*'
+        }
+        
     session_id = str(uuid.uuid4())
     q = queue.Queue()
     mcp_sessions[session_id] = q
 
     def generate():
-        # 1. MCP Standard requires sending the POST endpoint first
         post_url = f"{BACKEND_PUBLIC_URL}/mcp/message?session_id={session_id}"
         yield f"event: endpoint\ndata: {post_url}\n\n"
         
         while True:
             try:
-                # 2. Wait for messages placed in the queue by the POST route
                 message = q.get(timeout=15)
                 yield f"data: {json.dumps(message)}\n\n"
             except queue.Empty:
                 yield ": keepalive\n\n"
 
-    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+    response = Response(stream_with_context(generate()), mimetype="text/event-stream")
+    # 2. Force Render to stop buffering the stream
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no' 
+    response.headers['Connection'] = 'keep-alive'
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
-@app.route('/mcp/message', methods=['POST'])
+@app.route('/mcp/message', methods=['POST', 'OPTIONS'])
 def mcp_message():
     """Handles incoming JSON-RPC tool calls from Gemini"""
+    if request.method == 'OPTIONS':
+        return '', 204, {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, OPTIONS',
+            'Access-Control-Allow-Headers': '*'
+        }
+        
     session_id = request.args.get('session_id')
     req = request.json or {}
     method = req.get("method")
@@ -322,9 +340,8 @@ def mcp_message():
             "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.0"}
         }
     elif method == "notifications/initialized":
-        return "", 202
+        return "", 202, {'Access-Control-Allow-Origin': '*'}
     elif method == "tools/list":
-        # Tell Gemini what database powers it has
         response["result"] = {
             "tools": [
                 {
@@ -375,29 +392,13 @@ def mcp_message():
     else:
         response["error"] = {"code": -32601, "message": "Method not found"}
 
-    # Route response back to the SSE stream Gemini is listening to
     if session_id in mcp_sessions and msg_id is not None:
         mcp_sessions[session_id].put(response)
-        return "", 202
+        return "", 202, {'Access-Control-Allow-Origin': '*'}
     else:
-        return jsonify(response)
-
-# ------------------------------------------
-# Dummy OAuth Bypasses for Gemini UI
-# ------------------------------------------
-@app.route('/oauth/auth', methods=['GET'])
-def oauth_auth():
-    redirect_uri = request.args.get('redirect_uri')
-    state = request.args.get('state')
-    return f'<script>window.location.href="{redirect_uri}?code=mcp_bypass_code&state={state}";</script>'
-
-@app.route('/oauth/token', methods=['POST'])
-def oauth_token():
-    return jsonify({"access_token": "mcp_bypass_token", "token_type": "Bearer", "expires_in": 360000})
-
-
-
-
+        resp = jsonify(response)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        return resp
 # ==========================================
 # 7. ROUTERS
 # ==========================================
