@@ -101,8 +101,22 @@ CRITICAL RESTRICTION: You are the Assistant. Only generate the Assistant's reply
 """
 
 # ==========================================
-# 4. AI PROVIDERS (Gemini Integration)
+# 4. AI PROVIDERS (Demo Fallback & Prod Gemini)
 # ==========================================
+def stream_deepseek(prompt):
+    """Fallback engine using DeepSeek via g4f for Demo mode"""
+    try:
+        response = g4f.ChatCompletion.create(
+            model=g4f.models.deepseek_v3,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True
+        )
+        for chunk in response:
+            yield str(chunk)
+    except Exception as e:
+        print(f"⚠️ DeepSeek fallback error: {e}")
+        yield "\n\n*Connection error. Please try again shortly.*"
+
 def stream_copilot(message):
     q = queue.Queue()
     def generate_conversation_id():
@@ -131,7 +145,7 @@ def stream_copilot(message):
                     except asyncio.TimeoutError:
                         break
         except Exception:
-            q.put("\n\n*The connection was interrupted. Please ask your question again.*")
+            q.put("__COPILOT_FAIL__")
         finally:
             q.put(None)
 
@@ -148,13 +162,27 @@ def stream_copilot(message):
             break
         yield chunk
 
+def stream_demo_with_fallback(prompt):
+    """Tries Copilot first; falls back to DeepSeek if Copilot fails"""
+    failed = False
+    for chunk in stream_copilot(prompt):
+        if chunk == "__COPILOT_FAIL__":
+            failed = True
+            break
+        yield chunk
+
+    if failed:
+        print("⚠️ Copilot failed. Executing fallback to DeepSeek...")
+        for chunk in stream_deepseek(prompt):
+            yield chunk
+
 def stream_gemini(messages, api_key, model="gemini-1.5-flash"):
+    """Strictly used for Production mode clients"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
     
     contents = []
     system_instruction = None
     
-    # Map standard roles to Gemini roles
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content", "")
@@ -446,17 +474,15 @@ def get_b2b_client(client_id):
         print(f"⚠️ Error reading Firestore: {e}")
         return None
 
-# --- NEW CHAT LOGGING FUNCTIONS ---
+# --- CHAT LOGGING FUNCTIONS ---
 def log_chat_message(client_id, conversation_id, role, content):
     if not firebase_admin._apps or not content: 
         return
     try:
         db = firestore.client()
-        # Update the main conversation document with the latest timestamp
         conv_ref = db.collection('b2b_clients').document(client_id).collection('conversations').document(conversation_id)
         conv_ref.set({'last_updated': firestore.SERVER_TIMESTAMP}, merge=True)
         
-        # Add the specific message to the messages subcollection
         conv_ref.collection('messages').add({
             'role': role,
             'content': content,
@@ -486,7 +512,6 @@ def get_chat_logs():
         
     try:
         db = firestore.client()
-        # Fetch the 20 most recent conversations for this client
         convs_ref = db.collection('b2b_clients').document(client_id).collection('conversations').order_by('last_updated', direction=firestore.Query.DESCENDING).limit(20)
         convs = convs_ref.get()
         
@@ -516,7 +541,7 @@ def get_chat_logs():
         print(f"⚠️ Error reading logs: {e}")
         return jsonify({"error": "Failed to fetch logs"}), 500
 
-# --- UPDATED CHAT ROUTE ---
+# --- MAIN CHAT ROUTE (Prod vs Demo Switching) ---
 @app.route('/b2b/chat', methods=['POST'])
 def b2b_chat():
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -527,8 +552,8 @@ def b2b_chat():
     client_id = data.get('client_id')
     user_message = data.get('message', '').strip()
     history = data.get('history', [])
+    mode = data.get('mode', 'demo') # Expected to be 'prod' from widget.html, otherwise 'demo'
     
-    # Check if the frontend provided a session ID. If not, generate a temporary one.
     conversation_id = data.get('conversation_id')
     if not conversation_id:
         conversation_id = f"anon_{str(uuid.uuid4())[:8]}"
@@ -540,24 +565,31 @@ def b2b_chat():
     if not client_data or not client_data.get('is_active', False):
         return jsonify({"error": "Bot unavailable or inactive"}), 403
 
-    # Log the incoming customer message immediately in the background
     threading.Thread(target=log_chat_message, args=(client_id, conversation_id, "user", user_message), daemon=True).start()
 
     business_knowledge = client_data.get('business_data', 'No specific business data provided.')
-    # NOW PULLING GEMINI KEY INSTEAD OF OPENAI
-    commercial_key = client_data.get('gemini_api_key') 
+    gemini_key = client_data.get('gemini_api_key')
     owner_email = client_data.get('owner_email') 
 
     full_system_instruction = f"{BASE_SYSTEM_PROMPT}\n\n--- BUSINESS DATA ---\n{business_knowledge}\n-------------------"
 
-    if commercial_key:
+    # ----------------------------------------------------
+    # PRODUCTION MODE: Strictly requires Gemini API Key
+    # ----------------------------------------------------
+    if mode == 'prod':
+        if not gemini_key:
+            return jsonify({"error": "Missing gemini_api_key. Production license required."}), 402
+
         messages = [{"role": "system", "content": full_system_instruction}]
         for turn in history[-10:]:
             messages.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
         messages.append({"role": "user", "content": user_message})
-        # ROUTES TO GEMINI INSTEAD OF OPENAI
-        base_stream = stream_gemini(messages, commercial_key)
         
+        base_stream = stream_gemini(messages, gemini_key)
+
+    # ----------------------------------------------------
+    # DEMO MODE: Uses free Copilot with DeepSeek Fallback
+    # ----------------------------------------------------
     else:
         history_transcript = ""
         temp_history = []
@@ -581,12 +613,11 @@ def b2b_chat():
             f"CRITICAL: Respond to the Customer's latest message based ONLY on the Business Data above. DO NOT write the Customer's response.\n"
             f"Customer: {user_message}\nAssistant:"
         )
-        base_stream = stream_copilot(full_prompt)
+        base_stream = stream_demo_with_fallback(full_prompt)
 
     secure_stream = intercept_leads(base_stream, owner_email, client_id, conversation_id)
-    
-    # Wrap the secure stream with the logger before sending it to the user
     final_logged_stream = capture_and_log_stream(secure_stream, client_id, conversation_id)
+    
     return Response(stream_with_context(final_logged_stream), mimetype='text/plain')
 
 if __name__ == '__main__':
