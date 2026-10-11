@@ -434,6 +434,44 @@ def get_b2b_client(client_id):
         print(f"⚠️ Error reading Firestore: {e}")
         return None
 
+def get_b2b_client(client_id):
+    if not firebase_admin._apps:
+        return None
+    try:
+        db = firestore.client()
+        doc = db.collection('b2b_clients').document(client_id).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception as e:
+        print(f"⚠️ Error reading Firestore: {e}")
+        return None
+
+# --- NEW CHAT LOGGING FUNCTIONS ---
+def log_chat_message(client_id, role, content):
+    if not firebase_admin._apps or not content: 
+        return
+    try:
+        db = firestore.client()
+        # Saves logs inside a 'chat_logs' subcollection for each specific client
+        db.collection('b2b_clients').document(client_id).collection('chat_logs').add({
+            'role': role,
+            'content': content,
+            'timestamp': firestore.SERVER_TIMESTAMP
+        })
+    except Exception as e:
+        print(f"⚠️ Failed to log chat: {e}")
+
+def capture_and_log_stream(generator, client_id):
+    """Intercepts the stream to save the AI's final answer after it finishes generating."""
+    full_response = ""
+    for chunk in generator:
+        full_response += chunk
+        yield chunk
+    
+    # Save the complete AI response in the background
+    if full_response.strip():
+        threading.Thread(target=log_chat_message, args=(client_id, "assistant", full_response), daemon=True).start()
+
+# --- UPDATED CHAT ROUTE ---
 @app.route('/b2b/chat', methods=['POST'])
 def b2b_chat():
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -451,6 +489,9 @@ def b2b_chat():
     client_data = get_b2b_client(client_id)
     if not client_data or not client_data.get('is_active', False):
         return jsonify({"error": "Bot unavailable or inactive"}), 403
+
+    # Log the incoming customer message immediately in the background
+    threading.Thread(target=log_chat_message, args=(client_id, "user", user_message), daemon=True).start()
 
     business_knowledge = client_data.get('business_data', 'No specific business data provided.')
     commercial_key = client_data.get('openai_api_key')
@@ -482,7 +523,6 @@ def b2b_chat():
             
         history_transcript = "".join(temp_history)
         
-        # PROMPT INVERSION FIX: System instructions go at the BOTTOM so the AI doesn't forget them.
         full_prompt = (
             f"### Past Conversation:\n{history_transcript}\n\n"
             f"### System Instructions & Data:\n{full_system_instruction}\n\n"
@@ -492,7 +532,10 @@ def b2b_chat():
         base_stream = stream_copilot(full_prompt)
 
     secure_stream = intercept_leads(base_stream, owner_email, client_id)
-    return Response(stream_with_context(secure_stream), mimetype='text/plain')
+    
+    # Wrap the secure stream with the logger before sending it to the user
+    final_logged_stream = capture_and_log_stream(secure_stream, client_id)
+    return Response(stream_with_context(final_logged_stream), mimetype='text/plain')
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
