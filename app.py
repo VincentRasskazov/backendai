@@ -19,7 +19,7 @@ from firebase_admin import credentials, messaging, firestore
 
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, supports_credentials=True)
 
 # ==========================================
 # 1. DATABASE & API SETUP
@@ -283,16 +283,9 @@ def intercept_leads(generator, owner_email, client_id):
 mcp_sessions = {}
 
 # 1. Provide OAuth Discovery so Gemini knows this is a valid server
-@app.route('/.well-known/oauth-authorization-server', methods=['GET', 'OPTIONS'])
-@app.route('/.well-known/openid-configuration', methods=['GET', 'OPTIONS'])
+@app.route('/.well-known/oauth-authorization-server', methods=['GET'])
+@app.route('/.well-known/openid-configuration', methods=['GET'])
 def well_known_discovery():
-    if request.method == 'OPTIONS':
-        resp = Response(status=204)
-        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-        resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return resp
-
     metadata = {
         "issuer": BACKEND_PUBLIC_URL,
         "authorization_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/auth",
@@ -301,21 +294,11 @@ def well_known_discovery():
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"]
     }
-    resp = jsonify(metadata)
-    resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-    return resp
+    return jsonify(metadata)
 
-# 2. Main MCP stream with strict CORS for Gemini
-@app.route('/mcp', methods=['GET', 'OPTIONS'])
+# 2. Main MCP stream
+@app.route('/mcp', methods=['GET'])
 def mcp_sse():
-    if request.method == 'OPTIONS':
-        resp = Response(status=204)
-        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-        resp.headers['Access-Control-Allow-Credentials'] = 'true'
-        resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-mcp-session'
-        return resp
-
     session_id = str(uuid.uuid4())
     q = queue.Queue()
     mcp_sessions[session_id] = q
@@ -324,36 +307,31 @@ def mcp_sse():
         yield ": start\n\n"
         post_url = f"{BACKEND_PUBLIC_URL}/mcp/message?session_id={session_id}"
         yield f"event: endpoint\ndata: {post_url}\n\n"
+        
         while True:
             try:
                 message = q.get(timeout=15)
-                yield f"data: {json.dumps(message)}\n\n"
+                # CRITICAL FIX: Add explicit event: message
+                yield f"event: message\ndata: {json.dumps(message)}\n\n"
             except queue.Empty:
                 yield ": keepalive\n\n"
 
     response = Response(stream_with_context(generate()), mimetype="text/event-stream")
     response.headers['Cache-Control'] = 'no-cache, no-transform'
     response.headers['X-Accel-Buffering'] = 'no'
-    response.headers['Connection'] = 'keep-alive'
-    response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-    response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 
 # 3. Message endpoint for JSON-RPC
-@app.route('/mcp/message', methods=['POST', 'OPTIONS'])
+@app.route('/mcp/message', methods=['POST'])
 def mcp_message():
-    if request.method == 'OPTIONS':
-        resp = Response(status=204)
-        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-        resp.headers['Access-Control-Allow-Credentials'] = 'true'
-        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-mcp-session'
-        return resp
-        
     session_id = request.args.get('session_id')
     req = request.json or {}
     method = req.get("method")
     msg_id = req.get("id")
+
+    # Handle notifications which do not require a JSON-RPC response body
+    if method == "notifications/initialized":
+        return '', 202
 
     response = {"jsonrpc": "2.0", "id": msg_id}
 
@@ -363,11 +341,6 @@ def mcp_message():
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.0"}
         }
-    elif method == "notifications/initialized":
-        resp = Response(status=202)
-        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-        resp.headers['Access-Control-Allow-Credentials'] = 'true'
-        return resp
     elif method == "tools/list":
         response["result"] = {
             "tools": [
@@ -421,35 +394,22 @@ def mcp_message():
 
     if session_id in mcp_sessions and msg_id is not None:
         mcp_sessions[session_id].put(response)
-        resp = Response(status=202)
+        return '', 202
     else:
-        resp = jsonify(response)
-        
-    resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-    resp.headers['Access-Control-Allow-Credentials'] = 'true'
-    return resp
+        return jsonify(response)
 
 # ------------------------------------------
 # Dummy OAuth Bypasses for Gemini UI
 # ------------------------------------------
-@app.route('/oauth/auth', methods=['GET', 'OPTIONS'])
+@app.route('/oauth/auth', methods=['GET'])
 def oauth_auth():
     redirect_uri = request.args.get('redirect_uri')
     state = request.args.get('state')
     return f'<script>window.location.href="{redirect_uri}?code=mcp_bypass_code&state={state}";</script>'
 
-@app.route('/oauth/token', methods=['POST', 'OPTIONS'])
+@app.route('/oauth/token', methods=['POST'])
 def oauth_token():
-    if request.method == 'OPTIONS':
-        resp = Response(status=204)
-        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-        return resp
-    
-    resp = jsonify({"access_token": "mcp_bypass_token", "token_type": "Bearer", "expires_in": 360000})
-    resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
-    return resp
+    return jsonify({"access_token": "mcp_bypass_token", "token_type": "Bearer", "expires_in": 360000})
 # ==========================================
 # 7. ROUTERS
 # ==========================================
