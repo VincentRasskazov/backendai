@@ -17,8 +17,8 @@ from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, messaging, firestore
 
-
 app = Flask(__name__)
+
 # ==========================================
 # 1. DATABASE & API SETUP
 # ==========================================
@@ -91,7 +91,7 @@ If the answer is not in the Business Data, politely say you don't know and ask f
 
 LEAD CAPTURE RULES:
 1. Be conversational. Ask questions to figure out what specific service the customer needs.
-2. Once you know what they need, gently ask for their name and phone number to arrange a callback.
+​2. Once you know what they need, gently ask for their name and phone number to arrange a callback.
 3. As soon as they provide their name and phone number, you MUST output a secret tracking tag summarizing the lead.
    Format the tag EXACTLY like this with pipe symbols: ||LEAD: Name | Phone | Brief summary of what they need||
    CRITICAL: ONLY OUTPUT THIS TAG EXACTLY ONCE. If you have already thanked them for their details in a previous message, DO NOT output the tag again.
@@ -101,7 +101,7 @@ CRITICAL RESTRICTION: You are the Assistant. Only generate the Assistant's reply
 """
 
 # ==========================================
-# 4. AI PROVIDERS
+# 4. AI PROVIDERS (Gemini Integration)
 # ==========================================
 def stream_copilot(message):
     q = queue.Queue()
@@ -148,26 +148,44 @@ def stream_copilot(message):
             break
         yield chunk
 
-def stream_openai(messages, api_key, model="gpt-4o-mini"):
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    payload = {"model": model, "messages": messages, "stream": True}
+def stream_gemini(messages, api_key, model="gemini-1.5-flash"):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+    
+    contents = []
+    system_instruction = None
+    
+    # Map standard roles to Gemini roles
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+        
+        if role == "system":
+            system_instruction = {"parts": [{"text": content}]}
+        else:
+            gemini_role = "model" if role == "assistant" else "user"
+            contents.append({"role": gemini_role, "parts": [{"text": content}]})
+            
+    payload = {"contents": contents}
+    if system_instruction:
+        payload["systemInstruction"] = system_instruction
+        
+    headers = {"Content-Type": "application/json"}
+    
     try:
         with requests.post(url, json=payload, headers=headers, stream=True, timeout=30) as r:
             for line in r.iter_lines(decode_unicode=True):
                 if line and line.startswith("data: "):
                     data_str = line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
                     try:
                         chunk_json = json.loads(data_str)
-                        content = chunk_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if content:
-                            yield content
-                    except:
+                        candidates = chunk_json.get("candidates", [])
+                        if candidates:
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if parts:
+                                text = parts[0].get("text", "")
+                                if text:
+                                    yield text
+                    except Exception:
                         pass
     except Exception:
         yield "\n\n*Connection error. Please try again.*"
@@ -273,7 +291,6 @@ def intercept_leads(generator, owner_email, client_id, conversation_id):
                 email_sent = True
         else:
             yield buffer
-
 
 # ==========================================
 # 6. MCP SERVER (GEMINI INTEGRATION)
@@ -411,7 +428,6 @@ def mcp_message():
     
     return jsonify(response)
 
-
 # ==========================================
 # 7. ROUTERS
 # ==========================================
@@ -528,7 +544,8 @@ def b2b_chat():
     threading.Thread(target=log_chat_message, args=(client_id, conversation_id, "user", user_message), daemon=True).start()
 
     business_knowledge = client_data.get('business_data', 'No specific business data provided.')
-    commercial_key = client_data.get('openai_api_key')
+    # NOW PULLING GEMINI KEY INSTEAD OF OPENAI
+    commercial_key = client_data.get('gemini_api_key') 
     owner_email = client_data.get('owner_email') 
 
     full_system_instruction = f"{BASE_SYSTEM_PROMPT}\n\n--- BUSINESS DATA ---\n{business_knowledge}\n-------------------"
@@ -538,7 +555,8 @@ def b2b_chat():
         for turn in history[-10:]:
             messages.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
         messages.append({"role": "user", "content": user_message})
-        base_stream = stream_openai(messages, commercial_key)
+        # ROUTES TO GEMINI INSTEAD OF OPENAI
+        base_stream = stream_gemini(messages, commercial_key)
         
     else:
         history_transcript = ""
