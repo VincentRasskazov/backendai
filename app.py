@@ -290,7 +290,6 @@ def apply_cors(response):
     else:
         response.headers['Access-Control-Allow-Origin'] = '*'
         
-    # Added HEAD and POST to allowed methods
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, HEAD'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-mcp-session'
     return response
@@ -300,55 +299,25 @@ def apply_cors(response):
 def handle_options(path):
     return '', 204
 
-# 2. Provide OAuth Discovery (Added missing paths from Gemini's 404 logs)
-@app.route('/.well-known/oauth-authorization-server', methods=['GET'])
-@app.route('/.well-known/openid-configuration', methods=['GET'])
-@app.route('/mcp/.well-known/oauth-authorization-server', methods=['GET'])
-@app.route('/.well-known/oauth-protected-resource', methods=['GET'])
-@app.route('/.well-known/oauth-protected-resource/mcp', methods=['GET'])
-def well_known_discovery():
-    return jsonify({
-        "issuer": BACKEND_PUBLIC_URL,
-        "resource": BACKEND_PUBLIC_URL,
-        "authorization_servers": [BACKEND_PUBLIC_URL],
-        "authorization_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/auth",
-        "token_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/token",
-        "registration_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/register",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["none"]
-    })
-
-# 3. Dynamic Registration Endpoint
-@app.route('/oauth/register', methods=['POST'])
-def oauth_register():
-    return jsonify({
-        "client_id": "gemini_client",
-        "client_secret": "gemini_secret",
-        "client_id_issued_at": int(time.time()),
-        "client_secret_expires_at": 0
-    }), 201
-
-# 4. Main MCP stream (Now allows POST to accept Gemini's initialization probe)
+# 2. Main MCP stream (Handles both SSE and HTTP POST transport)
 @app.route('/mcp', strict_slashes=False, methods=['GET', 'POST', 'HEAD'])
 def mcp_main():
     # Handle the initial ping from Gemini
     if request.method == 'HEAD':
         return '', 200
         
-    # Handle direct JSON-RPC POST probes from Gemini
+    # Handle direct JSON-RPC POST probes from Gemini (HTTP Transport)
     if request.method == 'POST':
         return mcp_message()
         
-    # Handle GET (Standard SSE Stream)
+    # Handle GET (Standard SSE Transport)
     session_id = str(uuid.uuid4())
     q = queue.Queue()
     mcp_sessions[session_id] = q
 
     def generate():
         yield ": start\n\n"
-        # Point the endpoint back to /mcp for follow-up messages
-        post_url = f"{BACKEND_PUBLIC_URL}/mcp?session_id={session_id}"
+        post_url = f"{BACKEND_PUBLIC_URL}/mcp/message?session_id={session_id}"
         yield f"event: endpoint\ndata: {post_url}\n\n"
         
         while True:
@@ -365,7 +334,7 @@ def mcp_main():
     response.headers['Connection'] = 'keep-alive'
     return response
 
-# 5. Message endpoint for JSON-RPC
+# 3. Message endpoint for JSON-RPC
 @app.route('/mcp/message', strict_slashes=False, methods=['POST'])
 def mcp_message():
     session_id = request.args.get('session_id')
@@ -435,24 +404,11 @@ def mcp_message():
     else:
         response["error"] = {"code": -32601, "message": "Method not found"}
 
-    # If an SSE stream is active, route message to the queue
     if session_id and session_id in mcp_sessions and msg_id is not None:
         mcp_sessions[session_id].put(response)
         return '', 202
     
-    # If Gemini posts directly via HTTP instead of SSE, return the JSON immediately
     return jsonify(response)
-
-# 6. Dummy OAuth Bypasses
-@app.route('/oauth/auth', methods=['GET'])
-def oauth_auth():
-    redirect_uri = request.args.get('redirect_uri')
-    state = request.args.get('state')
-    return f'<script>window.location.href="{redirect_uri}?code=mcp_bypass_code&state={state}";</script>'
-
-@app.route('/oauth/token', methods=['POST'])
-def oauth_token():
-    return jsonify({"access_token": "mcp_bypass_token", "token_type": "Bearer", "expires_in": 360000})
 # ==========================================
 # 7. ROUTERS
 # ==========================================
