@@ -175,7 +175,7 @@ def stream_openai(messages, api_key, model="gpt-4o-mini"):
 # ==========================================
 # 5. LEAD CATCHER ENGINE (Anti-Spam Locked)
 # ==========================================
-def send_lead_email(owner_email, lead_text, client_id):
+def send_lead_email(owner_email, lead_text, client_id, conversation_id):
     if not owner_email or not resend.api_key:
         return
         
@@ -190,8 +190,7 @@ def send_lead_email(owner_email, lead_text, client_id):
     else:
         display_html = f"<p><b>Lead Details:</b> {lead_text}</p>"
 
-    # Generates the custom URL for this specific client
-    logs_url = f"https://vincentrasskazov.com.au/ai/logs.html?client={client_id}"
+    logs_url = f"https://vincentrasskazov.com.au/ai/logs.html?client={client_id}&conv={conversation_id}"
 
     try:
         resend.Emails.send({
@@ -205,9 +204,7 @@ def send_lead_email(owner_email, lead_text, client_id):
                 <div style="background: #f8fafc; padding: 20px; border-left: 4px solid #3b82f6; border-radius: 4px; font-size: 16px; margin-top: 20px; margin-bottom: 25px;">
                     {display_html}
                 </div>
-                
                 <a href="{logs_url}" style="background-color: #111827; color: #ffffff; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">View Chat Transcript</a>
-                
                 <p style="color: #9ca3af; font-size: 12px; margin-top: 40px; border-top: 1px solid #e5e7eb; padding-top: 15px;">Powered by Vincent Rasskazov AI</p>
             </div>
             """
@@ -216,10 +213,10 @@ def send_lead_email(owner_email, lead_text, client_id):
     except Exception as e:
         print(f"⚠️ Failed to send lead email: {e}")
 
-def intercept_leads(generator, owner_email, client_id):
+def intercept_leads(generator, owner_email, client_id, conversation_id):
     buffer = ""
     inside_tag = False
-    email_sent = False # HARD LOCK: Max 1 email per user message
+    email_sent = False 
     
     for chunk in generator:
         buffer += chunk
@@ -235,7 +232,6 @@ def intercept_leads(generator, owner_email, client_id):
                 else:
                     idx = buffer.find("||")
                     after_pipes = buffer[idx+2:]
-                    
                     if "LEAD:".startswith(after_pipes):
                         if idx > 0:
                             yield buffer[:idx]
@@ -258,9 +254,8 @@ def intercept_leads(generator, owner_email, client_id):
                 tag_string = buffer[:end_idx]
                 lead_data = tag_string.replace("||LEAD:", "").replace("||", "").strip()
                 
-                # ONLY fire if we haven't sent one for this specific chat burst yet
                 if not email_sent:
-                    threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id), daemon=True).start()
+                    threading.Thread(target=send_lead_email, args=(owner_email, lead_data, client_id, conversation_id), daemon=True).start()
                     email_sent = True
                 
                 buffer = buffer[end_idx:]
@@ -274,11 +269,10 @@ def intercept_leads(generator, owner_email, client_id):
         if inside_tag:
             lead_data = buffer.replace("||LEAD:", "").replace("||", "").strip()
             if lead_data and not email_sent:
-                threading.Thread(target=send_lead_email, args=(owner_email, lead_data + " [Incomplete]", client_id), daemon=True).start()
+                threading.Thread(target=send_lead_email, args=(owner_email, lead_data + " [Incomplete]", client_id, conversation_id), daemon=True).start()
                 email_sent = True
         else:
             yield buffer
-
 
 
 # ==========================================
@@ -286,7 +280,6 @@ def intercept_leads(generator, owner_email, client_id):
 # ==========================================
 mcp_sessions = {}
 
-# 1. Bulletproof Global CORS Handler
 @app.after_request
 def apply_cors(response):
     origin = request.headers.get('Origin')
@@ -305,18 +298,14 @@ def apply_cors(response):
 def handle_options(path):
     return '', 204
 
-# 2. Main MCP stream (Handles both SSE and HTTP POST transport)
 @app.route('/mcp', strict_slashes=False, methods=['GET', 'POST', 'HEAD'])
 def mcp_main():
-    # Handle the initial ping from Gemini
     if request.method == 'HEAD':
         return '', 200
         
-    # Handle direct JSON-RPC POST probes from Gemini (HTTP Transport)
     if request.method == 'POST':
         return mcp_message()
         
-    # Handle GET (Standard SSE Transport)
     session_id = str(uuid.uuid4())
     q = queue.Queue()
     mcp_sessions[session_id] = q
@@ -340,7 +329,6 @@ def mcp_main():
     response.headers['Connection'] = 'keep-alive'
     return response
 
-# 3. Message endpoint for JSON-RPC
 @app.route('/mcp/message', strict_slashes=False, methods=['POST'])
 def mcp_message():
     session_id = request.args.get('session_id')
@@ -422,6 +410,8 @@ def mcp_message():
         return '', 202
     
     return jsonify(response)
+
+
 # ==========================================
 # 7. ROUTERS
 # ==========================================
@@ -440,17 +430,35 @@ def get_b2b_client(client_id):
         print(f"⚠️ Error reading Firestore: {e}")
         return None
 
-def get_b2b_client(client_id):
-    if not firebase_admin._apps:
-        return None
+# --- NEW CHAT LOGGING FUNCTIONS ---
+def log_chat_message(client_id, conversation_id, role, content):
+    if not firebase_admin._apps or not content: 
+        return
     try:
         db = firestore.client()
-        doc = db.collection('b2b_clients').document(client_id).get()
-        return doc.to_dict() if doc.exists else None
+        # Update the main conversation document with the latest timestamp
+        conv_ref = db.collection('b2b_clients').document(client_id).collection('conversations').document(conversation_id)
+        conv_ref.set({'last_updated': firestore.SERVER_TIMESTAMP}, merge=True)
+        
+        # Add the specific message to the messages subcollection
+        conv_ref.collection('messages').add({
+            'role': role,
+            'content': content,
+            'timestamp': firestore.SERVER_TIMESTAMP
+        })
     except Exception as e:
-        print(f"⚠️ Error reading Firestore: {e}")
-        return None
+        print(f"⚠️ Failed to log chat: {e}")
 
+def capture_and_log_stream(generator, client_id, conversation_id):
+    full_response = ""
+    for chunk in generator:
+        full_response += chunk
+        yield chunk
+    
+    if full_response.strip():
+        threading.Thread(target=log_chat_message, args=(client_id, conversation_id, "assistant", full_response), daemon=True).start()
+
+# --- FETCH LOGS ROUTE ---
 @app.route('/b2b/logs', methods=['GET'])
 def get_chat_logs():
     client_id = request.args.get('client_id')
@@ -462,51 +470,35 @@ def get_chat_logs():
         
     try:
         db = firestore.client()
-        # Fetch logs ordered from oldest to newest
-        logs_ref = db.collection('b2b_clients').document(client_id).collection('chat_logs').order_by('timestamp')
-        docs = logs_ref.get()
+        # Fetch the 20 most recent conversations for this client
+        convs_ref = db.collection('b2b_clients').document(client_id).collection('conversations').order_by('last_updated', direction=firestore.Query.DESCENDING).limit(20)
+        convs = convs_ref.get()
         
-        logs = []
-        for doc in docs:
-            data = doc.to_dict()
-            # Convert Firestore timestamp to a readable string format for the web
-            if 'timestamp' in data and data['timestamp']:
-                try:
-                    data['timestamp'] = data['timestamp'].isoformat()
-                except:
-                    data['timestamp'] = str(data['timestamp'])
-            logs.append(data)
+        all_logs = []
+        for conv in convs:
+            conv_id = conv.id
+            messages_ref = conv.reference.collection('messages').order_by('timestamp')
+            messages = messages_ref.get()
             
-        return jsonify({"client_id": client_id, "logs": logs})
+            msg_list = []
+            for msg in messages:
+                data = msg.to_dict()
+                if 'timestamp' in data and data['timestamp']:
+                    try:
+                        data['timestamp'] = data['timestamp'].isoformat()
+                    except:
+                        data['timestamp'] = str(data['timestamp'])
+                msg_list.append(data)
+                
+            all_logs.append({
+                "conversation_id": conv_id,
+                "messages": msg_list
+            })
+            
+        return jsonify({"client_id": client_id, "conversations": all_logs})
     except Exception as e:
         print(f"⚠️ Error reading logs: {e}")
         return jsonify({"error": "Failed to fetch logs"}), 500
-
-# --- NEW CHAT LOGGING FUNCTIONS ---
-def log_chat_message(client_id, role, content):
-    if not firebase_admin._apps or not content: 
-        return
-    try:
-        db = firestore.client()
-        # Saves logs inside a 'chat_logs' subcollection for each specific client
-        db.collection('b2b_clients').document(client_id).collection('chat_logs').add({
-            'role': role,
-            'content': content,
-            'timestamp': firestore.SERVER_TIMESTAMP
-        })
-    except Exception as e:
-        print(f"⚠️ Failed to log chat: {e}")
-
-def capture_and_log_stream(generator, client_id):
-    """Intercepts the stream to save the AI's final answer after it finishes generating."""
-    full_response = ""
-    for chunk in generator:
-        full_response += chunk
-        yield chunk
-    
-    # Save the complete AI response in the background
-    if full_response.strip():
-        threading.Thread(target=log_chat_message, args=(client_id, "assistant", full_response), daemon=True).start()
 
 # --- UPDATED CHAT ROUTE ---
 @app.route('/b2b/chat', methods=['POST'])
@@ -519,6 +511,11 @@ def b2b_chat():
     client_id = data.get('client_id')
     user_message = data.get('message', '').strip()
     history = data.get('history', [])
+    
+    # Check if the frontend provided a session ID. If not, generate a temporary one.
+    conversation_id = data.get('conversation_id')
+    if not conversation_id:
+        conversation_id = f"anon_{str(uuid.uuid4())[:8]}"
 
     if not client_id or not user_message:
         return jsonify({"error": "Missing client_id or message"}), 400
@@ -528,7 +525,7 @@ def b2b_chat():
         return jsonify({"error": "Bot unavailable or inactive"}), 403
 
     # Log the incoming customer message immediately in the background
-    threading.Thread(target=log_chat_message, args=(client_id, "user", user_message), daemon=True).start()
+    threading.Thread(target=log_chat_message, args=(client_id, conversation_id, "user", user_message), daemon=True).start()
 
     business_knowledge = client_data.get('business_data', 'No specific business data provided.')
     commercial_key = client_data.get('openai_api_key')
@@ -568,10 +565,10 @@ def b2b_chat():
         )
         base_stream = stream_copilot(full_prompt)
 
-    secure_stream = intercept_leads(base_stream, owner_email, client_id)
+    secure_stream = intercept_leads(base_stream, owner_email, client_id, conversation_id)
     
     # Wrap the secure stream with the logger before sending it to the user
-    final_logged_stream = capture_and_log_stream(secure_stream, client_id)
+    final_logged_stream = capture_and_log_stream(secure_stream, client_id, conversation_id)
     return Response(stream_with_context(final_logged_stream), mimetype='text/plain')
 
 if __name__ == '__main__':
