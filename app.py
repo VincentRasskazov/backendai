@@ -17,6 +17,7 @@ from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, messaging, firestore
 
+
 app = Flask(__name__)
 CORS(app)
 
@@ -274,8 +275,131 @@ def intercept_leads(generator, owner_email, client_id):
         else:
             yield buffer
 
+
+
+
 # ==========================================
-# 6. ROUTERS
+# 6. MCP SERVER (GEMINI INTEGRATION)
+# ==========================================
+mcp_sessions = {}
+
+@app.route('/mcp', methods=['GET'])
+def mcp_sse():
+    """SSE endpoint for Gemini MCP Connection"""
+    session_id = str(uuid.uuid4())
+    q = queue.Queue()
+    mcp_sessions[session_id] = q
+
+    def generate():
+        # 1. MCP Standard requires sending the POST endpoint first
+        post_url = f"{BACKEND_PUBLIC_URL}/mcp/message?session_id={session_id}"
+        yield f"event: endpoint\ndata: {post_url}\n\n"
+        
+        while True:
+            try:
+                # 2. Wait for messages placed in the queue by the POST route
+                message = q.get(timeout=15)
+                yield f"data: {json.dumps(message)}\n\n"
+            except queue.Empty:
+                yield ": keepalive\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
+@app.route('/mcp/message', methods=['POST'])
+def mcp_message():
+    """Handles incoming JSON-RPC tool calls from Gemini"""
+    session_id = request.args.get('session_id')
+    req = request.json or {}
+    method = req.get("method")
+    msg_id = req.get("id")
+
+    response = {"jsonrpc": "2.0", "id": msg_id}
+
+    if method == "initialize":
+        response["result"] = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.0"}
+        }
+    elif method == "notifications/initialized":
+        return "", 202
+    elif method == "tools/list":
+        # Tell Gemini what database powers it has
+        response["result"] = {
+            "tools": [
+                {
+                    "name": "get_client_data",
+                    "description": "Read business_data, owner_email, and is_active for a client.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"client_id": {"type": "string"}},
+                        "required": ["client_id"]
+                    }
+                },
+                {
+                    "name": "upsert_client_data",
+                    "description": "Create or update a client in the database.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "client_id": {"type": "string", "description": "e.g., demo-roofing"},
+                            "business_data": {"type": "string"},
+                            "owner_email": {"type": "string"},
+                            "is_active": {"type": "boolean"}
+                        },
+                        "required": ["client_id", "business_data", "owner_email"]
+                    }
+                }
+            ]
+        }
+    elif method == "tools/call":
+        params = req.get("params", {})
+        tool_name = params.get("name")
+        args = params.get("arguments", {})
+        db = firestore.client()
+        
+        try:
+            if tool_name == "get_client_data":
+                doc = db.collection('b2b_clients').document(args["client_id"]).get()
+                content = json.dumps(doc.to_dict(), indent=2) if doc.exists else "Client not found."
+                response["result"] = {"content": [{"type": "text", "text": content}]}
+                
+            elif tool_name == "upsert_client_data":
+                client_id = args.pop("client_id")
+                db.collection('b2b_clients').document(client_id).set(args, merge=True)
+                response["result"] = {"content": [{"type": "text", "text": f"Success: {client_id} saved to Firestore."}]}
+            else:
+                response["error"] = {"code": -32601, "message": "Tool not found"}
+        except Exception as e:
+            response["error"] = {"code": -32000, "message": str(e)}
+    else:
+        response["error"] = {"code": -32601, "message": "Method not found"}
+
+    # Route response back to the SSE stream Gemini is listening to
+    if session_id in mcp_sessions and msg_id is not None:
+        mcp_sessions[session_id].put(response)
+        return "", 202
+    else:
+        return jsonify(response)
+
+# ------------------------------------------
+# Dummy OAuth Bypasses for Gemini UI
+# ------------------------------------------
+@app.route('/oauth/auth', methods=['GET'])
+def oauth_auth():
+    redirect_uri = request.args.get('redirect_uri')
+    state = request.args.get('state')
+    return f'<script>window.location.href="{redirect_uri}?code=mcp_bypass_code&state={state}";</script>'
+
+@app.route('/oauth/token', methods=['POST'])
+def oauth_token():
+    return jsonify({"access_token": "mcp_bypass_token", "token_type": "Bearer", "expires_in": 360000})
+
+
+
+
+# ==========================================
+# 7. ROUTERS
 # ==========================================
 @app.route('/health', methods=['GET'])
 def health():
