@@ -282,20 +282,48 @@ def intercept_leads(generator, owner_email, client_id):
 # ==========================================
 mcp_sessions = {}
 
-@app.route('/mcp', methods=['GET'])
+# 1. Provide OAuth Discovery so Gemini knows this is a valid server
+@app.route('/.well-known/oauth-authorization-server', methods=['GET', 'OPTIONS'])
+@app.route('/.well-known/openid-configuration', methods=['GET', 'OPTIONS'])
+def well_known_discovery():
+    if request.method == 'OPTIONS':
+        resp = Response(status=204)
+        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return resp
+
+    metadata = {
+        "issuer": BACKEND_PUBLIC_URL,
+        "authorization_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/auth",
+        "token_endpoint": f"{BACKEND_PUBLIC_URL}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"]
+    }
+    resp = jsonify(metadata)
+    resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+    return resp
+
+# 2. Main MCP stream with strict CORS for Gemini
+@app.route('/mcp', methods=['GET', 'OPTIONS'])
 def mcp_sse():
-    """SSE endpoint for Gemini MCP Connection"""
+    if request.method == 'OPTIONS':
+        resp = Response(status=204)
+        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-mcp-session'
+        return resp
+
     session_id = str(uuid.uuid4())
     q = queue.Queue()
     mcp_sessions[session_id] = q
 
     def generate():
-        # Force flush through Render's proxy buffers so Gemini doesn't time out
         yield ": start\n\n"
-        
         post_url = f"{BACKEND_PUBLIC_URL}/mcp/message?session_id={session_id}"
         yield f"event: endpoint\ndata: {post_url}\n\n"
-        
         while True:
             try:
                 message = q.get(timeout=15)
@@ -304,15 +332,24 @@ def mcp_sse():
                 yield ": keepalive\n\n"
 
     response = Response(stream_with_context(generate()), mimetype="text/event-stream")
-    # Headers to completely disable Render buffering
     response.headers['Cache-Control'] = 'no-cache, no-transform'
     response.headers['X-Accel-Buffering'] = 'no'
     response.headers['Connection'] = 'keep-alive'
+    response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
     return response
 
-@app.route('/mcp/message', methods=['POST'])
+# 3. Message endpoint for JSON-RPC
+@app.route('/mcp/message', methods=['POST', 'OPTIONS'])
 def mcp_message():
-    """Handles incoming JSON-RPC tool calls from Gemini"""
+    if request.method == 'OPTIONS':
+        resp = Response(status=204)
+        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, x-mcp-session'
+        return resp
+        
     session_id = request.args.get('session_id')
     req = request.json or {}
     method = req.get("method")
@@ -327,7 +364,10 @@ def mcp_message():
             "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.0"}
         }
     elif method == "notifications/initialized":
-        return "", 202
+        resp = Response(status=202)
+        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        return resp
     elif method == "tools/list":
         response["result"] = {
             "tools": [
@@ -346,7 +386,7 @@ def mcp_message():
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "client_id": {"type": "string", "description": "e.g., demo-roofing"},
+                            "client_id": {"type": "string"},
                             "business_data": {"type": "string"},
                             "owner_email": {"type": "string"},
                             "is_active": {"type": "boolean"}
@@ -381,9 +421,35 @@ def mcp_message():
 
     if session_id in mcp_sessions and msg_id is not None:
         mcp_sessions[session_id].put(response)
-        return "", 202
+        resp = Response(status=202)
     else:
-        return jsonify(response)
+        resp = jsonify(response)
+        
+    resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+    resp.headers['Access-Control-Allow-Credentials'] = 'true'
+    return resp
+
+# ------------------------------------------
+# Dummy OAuth Bypasses for Gemini UI
+# ------------------------------------------
+@app.route('/oauth/auth', methods=['GET', 'OPTIONS'])
+def oauth_auth():
+    redirect_uri = request.args.get('redirect_uri')
+    state = request.args.get('state')
+    return f'<script>window.location.href="{redirect_uri}?code=mcp_bypass_code&state={state}";</script>'
+
+@app.route('/oauth/token', methods=['POST', 'OPTIONS'])
+def oauth_token():
+    if request.method == 'OPTIONS':
+        resp = Response(status=204)
+        resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return resp
+    
+    resp = jsonify({"access_token": "mcp_bypass_token", "token_type": "Bearer", "expires_in": 360000})
+    resp.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+    return resp
 # ==========================================
 # 7. ROUTERS
 # ==========================================
