@@ -499,7 +499,6 @@ def capture_and_log_stream(generator, client_id, conversation_id):
     
     if full_response.strip():
         threading.Thread(target=log_chat_message, args=(client_id, conversation_id, "assistant", full_response), daemon=True).start()
-
 # --- FETCH LOGS ROUTE ---
 @app.route('/b2b/logs', methods=['GET'])
 def get_chat_logs():
@@ -512,30 +511,62 @@ def get_chat_logs():
         
     try:
         db = firestore.client()
-        convs_ref = db.collection('b2b_clients').document(client_id).collection('conversations').order_by('last_updated', direction=firestore.Query.DESCENDING).limit(20)
-        convs = convs_ref.get()
-        
         all_logs = []
-        for conv in convs:
-            conv_id = conv.id
-            messages_ref = conv.reference.collection('messages').order_by('timestamp')
-            messages = messages_ref.get()
+        
+        # ADMIN GOD MODE: Fetch all conversations across all clients
+        if client_id == 'admin123':
+            clients = db.collection('b2b_clients').get()
+            for c in clients:
+                c_id = c.id
+                # Get the 15 most recent convos for each client to prevent massive payloads
+                convs = c.reference.collection('conversations').order_by('last_updated', direction=firestore.Query.DESCENDING).limit(15).get()
+                for conv in convs:
+                    conv_id = conv.id
+                    messages = conv.reference.collection('messages').order_by('timestamp').get()
+                    
+                    msg_list = []
+                    for msg in messages:
+                        data = msg.to_dict()
+                        if 'timestamp' in data and data['timestamp']:
+                            try:
+                                data['timestamp'] = data['timestamp'].isoformat()
+                            except:
+                                data['timestamp'] = str(data['timestamp'])
+                        msg_list.append(data)
+                        
+                    all_logs.append({
+                        "client_id": c_id,
+                        "conversation_id": conv_id,
+                        "messages": msg_list,
+                        "last_updated": conv.to_dict().get("last_updated", datetime.datetime.now()).isoformat() if conv.to_dict().get("last_updated") else ""
+                    })
             
-            msg_list = []
-            for msg in messages:
-                data = msg.to_dict()
-                if 'timestamp' in data and data['timestamp']:
-                    try:
-                        data['timestamp'] = data['timestamp'].isoformat()
-                    except:
-                        data['timestamp'] = str(data['timestamp'])
-                msg_list.append(data)
+            # Sort global logs newest to oldest
+            all_logs.sort(key=lambda x: x.get('last_updated', ''), reverse=True)
+            
+        # STANDARD CLIENT MODE: Fetch only their specific conversations
+        else:
+            convs = db.collection('b2b_clients').document(client_id).collection('conversations').order_by('last_updated', direction=firestore.Query.DESCENDING).limit(30).get()
+            for conv in convs:
+                conv_id = conv.id
+                messages = conv.reference.collection('messages').order_by('timestamp').get()
                 
-            all_logs.append({
-                "conversation_id": conv_id,
-                "messages": msg_list
-            })
-            
+                msg_list = []
+                for msg in messages:
+                    data = msg.to_dict()
+                    if 'timestamp' in data and data['timestamp']:
+                        try:
+                            data['timestamp'] = data['timestamp'].isoformat()
+                        except:
+                            data['timestamp'] = str(data['timestamp'])
+                    msg_list.append(data)
+                    
+                all_logs.append({
+                    "client_id": client_id,
+                    "conversation_id": conv_id,
+                    "messages": msg_list
+                })
+                
         return jsonify({"client_id": client_id, "conversations": all_logs})
     except Exception as e:
         print(f"⚠️ Error reading logs: {e}")
