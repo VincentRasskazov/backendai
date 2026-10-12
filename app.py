@@ -390,14 +390,14 @@ def mcp_message():
         response["result"] = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.1"}
+            "serverInfo": {"name": "vincent-firestore-mcp", "version": "1.2"}
         }
     elif method == "tools/list":
         response["result"] = {
             "tools": [
                 {
                     "name": "batch_process_clients",
-                    "description": "Send multiple clients at once. The server will check if they exist and only add new ones.",
+                    "description": "Send multiple clients at once. The server will strictly verify they don't exist before adding.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -430,17 +430,31 @@ def mcp_message():
             if tool_name == "batch_process_clients":
                 clients_list = args.get("clients", [])
                 results = []
+                clients_ref = db.collection('b2b_clients')
+                
                 for client in clients_list:
                     client_id = client.get("client_id")
-                    doc_ref = db.collection('b2b_clients').document(client_id)
+                    owner_email = client.get("owner_email", "").strip().lower()
                     
+                    # ADVANCED VERIFICATION 1: Check if the exact Client ID exists
+                    doc_ref = clients_ref.document(client_id)
                     if doc_ref.get().exists:
-                        results.append(f"Skipped {client_id}: Already exists in database.")
-                    else:
-                        client_data = client.copy()
-                        client_data.pop("client_id", None)
-                        doc_ref.set(client_data, merge=True)
-                        results.append(f"Success: {client_id} added.")
+                        results.append(f"Skipped {client_id}: Client ID already exists in the database.")
+                        continue
+                        
+                    # ADVANCED VERIFICATION 2: Check if the email is already registered to another ID
+                    email_query = clients_ref.where('owner_email', '==', owner_email).limit(1).get()
+                    if len(email_query) > 0:
+                        existing_doc_id = email_query[0].id
+                        results.append(f"Skipped {client_id}: The email {owner_email} is already registered to '{existing_doc_id}'.")
+                        continue
+                    
+                    # Passed all verifications - safe to insert
+                    client_data = client.copy()
+                    client_data.pop("client_id", None)
+                    client_data["owner_email"] = owner_email # Save the cleaned lowercase email
+                    doc_ref.set(client_data, merge=True)
+                    results.append(f"Success: {client_id} added safely.")
                 
                 response["result"] = {"content": [{"type": "text", "text": "\n".join(results)}]}
             else:
