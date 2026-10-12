@@ -12,6 +12,8 @@ import re
 import g4f
 import websockets
 import resend
+import imaplib
+from email.message import EmailMessage
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import firebase_admin
@@ -47,6 +49,8 @@ else:
 
 BACKEND_PUBLIC_URL = "https://backendai-ablv.onrender.com"
 resend.api_key = os.environ.get("RESEND_API_KEY")
+GMAIL_USER = os.environ.get("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 
 # ==========================================
 # 2. SERVER OPTIMIZATIONS
@@ -374,6 +378,7 @@ def mcp_main():
     response.headers['Connection'] = 'keep-alive'
     return response
 
+# 3. Message endpoint for JSON-RPC
 @app.route('/mcp/message', strict_slashes=False, methods=['POST'])
 def mcp_message():
     session_id = request.args.get('session_id')
@@ -397,7 +402,7 @@ def mcp_message():
             "tools": [
                 {
                     "name": "batch_process_clients",
-                    "description": "Send multiple clients at once. The server will strictly verify they don't exist before adding.",
+                    "description": "Send multiple clients at once. The server will check if they exist and only add new ones.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -417,6 +422,19 @@ def mcp_message():
                         },
                         "required": ["clients"]
                     }
+                },
+                {
+                    "name": "draft_outreach_email",
+                    "description": "Creates an email draft directly in the user's Gmail Drafts folder using raw HTML.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "to_email": {"type": "string"},
+                            "subject": {"type": "string"},
+                            "body_html": {"type": "string", "description": "The full email body in HTML format. Use <br> for line breaks and standard <a> tags for links."}
+                        },
+                        "required": ["to_email", "subject", "body_html"]
+                    }
                 }
             ]
         }
@@ -430,33 +448,41 @@ def mcp_message():
             if tool_name == "batch_process_clients":
                 clients_list = args.get("clients", [])
                 results = []
-                clients_ref = db.collection('b2b_clients')
-                
                 for client in clients_list:
                     client_id = client.get("client_id")
-                    owner_email = client.get("owner_email", "").strip().lower()
+                    doc_ref = db.collection('b2b_clients').document(client_id)
                     
-                    # ADVANCED VERIFICATION 1: Check if the exact Client ID exists
-                    doc_ref = clients_ref.document(client_id)
                     if doc_ref.get().exists:
-                        results.append(f"Skipped {client_id}: Client ID already exists in the database.")
-                        continue
-                        
-                    # ADVANCED VERIFICATION 2: Check if the email is already registered to another ID
-                    email_query = clients_ref.where('owner_email', '==', owner_email).limit(1).get()
-                    if len(email_query) > 0:
-                        existing_doc_id = email_query[0].id
-                        results.append(f"Skipped {client_id}: The email {owner_email} is already registered to '{existing_doc_id}'.")
-                        continue
-                    
-                    # Passed all verifications - safe to insert
-                    client_data = client.copy()
-                    client_data.pop("client_id", None)
-                    client_data["owner_email"] = owner_email # Save the cleaned lowercase email
-                    doc_ref.set(client_data, merge=True)
-                    results.append(f"Success: {client_id} added safely.")
+                        results.append(f"Skipped {client_id}: Already exists.")
+                    else:
+                        client_data = client.copy()
+                        client_data.pop("client_id", None)
+                        doc_ref.set(client_data, merge=True)
+                        results.append(f"Success: {client_id} added.")
                 
                 response["result"] = {"content": [{"type": "text", "text": "\n".join(results)}]}
+                
+            elif tool_name == "draft_outreach_email":
+                if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+                    raise Exception("Gmail credentials not configured on server.")
+                    
+                msg = EmailMessage()
+                msg['Subject'] = args.get("subject")
+                msg['From'] = GMAIL_USER
+                msg['To'] = args.get("to_email")
+                
+                # Set raw HTML content
+                msg.add_alternative(args.get("body_html"), subtype='html')
+                
+                # Connect to IMAP and append to Drafts
+                mail = imaplib.IMAP4_SSL('imap.gmail.com')
+                mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+                mail.select('"[Gmail]/Drafts"')
+                mail.append('"[Gmail]/Drafts"', '', imaplib.Time2Internaldate(time.time()), msg.as_bytes())
+                mail.logout()
+                
+                response["result"] = {"content": [{"type": "text", "text": f"Success: Draft created for {args.get('to_email')}."}]}
+                
             else:
                 response["error"] = {"code": -32601, "message": "Tool not found"}
         except Exception as e:
